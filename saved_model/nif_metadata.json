@@ -1,0 +1,29 @@
+{
+  "embedding_dimension": 10,
+  "embedding_sigma": 2.0,
+  "encode_params": {
+    "eps": 1e-08,
+    "log_tone_map": false,
+    "max": 255.0,
+    "mean": [
+      42.72856521606445,
+      56.061580657958984,
+      65.5223617553711
+    ],
+    "transfer_function": "linear"
+  },
+  "name": "Mandrill_portrait_2_Berlin_Zoo.jpg",
+  "original_image_shape": [
+    2048,
+    1533,
+    3
+  ],
+  "pytorch_model": "./saved_model/",
+  "train_command": [
+    "train_nif.py",
+    "--input",
+    "Mandrill_portrait_2_Berlin_Zoo.jpg",
+    "--epochs",
+    "20"
+  ]
+}

@@ -1,0 +1,6 @@
+torch>=2.0.0
+opencv-python
+python-magic
+scikit-image
+numpy
+pytest==6.2.5
