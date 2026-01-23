@@ -141,8 +141,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.layer_count % 2:
-        raise ValueError("Layer count must be a multiple of 2.")
+    if args.layer_count >= 4 and args.layer_count % 2:
+        raise ValueError("Layer count >= 4 must be a multiple of 2 (for skip connections).")
 
     device = du.get_device(args.device)
 

@@ -7,7 +7,8 @@ import torch.nn as nn
 class NIFModel(nn.Module):
     """Neural Image Field Model - MLP for image compression/reconstruction.
 
-    Uses ReLU activation with positional encoding and input skip connections.
+    Uses ReLU activation with positional encoding. For >= 4 layers, includes
+    input skip connections at the midpoint.
     """
 
     def __init__(
@@ -19,86 +20,69 @@ class NIFModel(nn.Module):
     ):
         super().__init__()
 
-        self.layer_size = layer_size
-        self.input_dim = input_dim
+        if num_layers < 2:
+            raise ValueError(f"num_layers must be >= 2, got {num_layers}")
 
-        if num_layers < 4:
-            raise ValueError(f"num_layers must be >= 4, got {num_layers}")
+        self.use_skip = num_layers >= 4
 
-        if layer_size <= input_dim:
+        if self.use_skip and layer_size <= input_dim:
             raise ValueError(
                 f"layer_size ({layer_size}) must be > input_dim ({input_dim}) "
                 f"to accommodate skip connections"
             )
 
-        half_size = num_layers // 2
-        concat_dim = input_dim
+        self.skip_index = num_layers // 2 if self.use_skip else -1
+        concat_dim = input_dim if self.use_skip else 0
 
-        # Front-end layers
-        front_end = []
-        for l in range(half_size - 1):
-            layer = nn.Linear(
-                layer_size if l > 0 else input_dim, layer_size, bias=False
-            )
-            nn.init.xavier_uniform_(layer.weight)
-            front_end.append(layer)
-            front_end.append(nn.ReLU())
+        # Build all layers
+        layers = []
+        for i in range(num_layers):
+            is_first = i == 0
+            is_last = i == num_layers - 1
+            is_skip_layer = i == self.skip_index
 
-        # Last layer of front-end reduces dimension for concatenation
-        last_front = nn.Linear(layer_size, layer_size - concat_dim, bias=False)
-        nn.init.xavier_uniform_(last_front.weight)
-        front_end.append(last_front)
-        front_end.append(nn.ReLU())
+            # Determine input/output dimensions
+            if is_first:
+                in_dim = input_dim
+            elif i == self.skip_index:
+                in_dim = layer_size  # After skip concat
+            else:
+                in_dim = layer_size
 
-        self.front_end = nn.Sequential(*front_end)
+            if is_last:
+                out_dim = 3
+            elif is_skip_layer:
+                out_dim = layer_size - concat_dim  # Leave room for concat
+            else:
+                out_dim = layer_size
 
-        # Back-end layers
-        back_end = []
-        for l in range(half_size - 1):
-            layer = nn.Linear(
-                layer_size, layer_size, bias=False if l < half_size - 2 else True
-            )
+            layer = nn.Linear(in_dim, out_dim, bias=is_last or i >= num_layers - 2)
             nn.init.xavier_uniform_(layer.weight)
             if layer.bias is not None:
                 nn.init.zeros_(layer.bias)
-            back_end.append(layer)
-            back_end.append(nn.ReLU())
 
-        # Penultimate layer (has bias)
-        penultimate = nn.Linear(layer_size, layer_size, bias=True)
-        nn.init.xavier_uniform_(penultimate.weight)
-        nn.init.zeros_(penultimate.bias)
-        back_end.append(penultimate)
-        back_end.append(nn.ReLU())
+            layers.append(layer)
 
-        # Final output layer (3 channels for RGB)
-        final = nn.Linear(layer_size, 3, bias=True)
-        nn.init.xavier_uniform_(final.weight)
-        nn.init.zeros_(final.bias)
-        back_end.append(final)
+        self.layers = nn.ModuleList(layers)
 
-        self.back_end = nn.Sequential(*back_end)
-
-        # Color space conversion layer (if needed)
+        # Color space conversion
         if color_matrix is not None:
             self.register_buffer("color_matrix", torch.from_numpy(color_matrix).float())
         else:
             self.color_matrix = None
 
     def forward(self, x):
-        """Forward pass through the network.
-
-        Args:
-            x: Input tensor of shape (batch_size, input_dim)
-
-        Returns:
-            Output tensor of shape (batch_size, 3) - RGB values
-        """
         input_for_skip = x
 
-        x = self.front_end(x)
-        x = torch.cat([x, input_for_skip], dim=1)
-        x = self.back_end(x)
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+
+            # Skip connection: concat input after the skip layer
+            if i == self.skip_index:
+                x = torch.relu(x)
+                x = torch.cat([x, input_for_skip], dim=1)
+            elif i < len(self.layers) - 1:
+                x = torch.relu(x)
 
         if self.color_matrix is not None:
             x = torch.nn.functional.linear(x, self.color_matrix)

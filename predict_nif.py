@@ -85,7 +85,7 @@ if __name__ == "__main__":
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model_config = checkpoint.get("model_config", {})
 
     model = nif_model.NIFModel(
