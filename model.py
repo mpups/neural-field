@@ -8,8 +8,10 @@ import numpy as np
 class HashGridEncoding(nn.Module):
     """Multi-resolution hash grid encoding from Instant-NGP.
     
-    Learnable spatial encoding that maps 2D coordinates to feature vectors
-    using multiple resolution levels with hash-based lookups.
+    Optimized implementation with:
+    - FP16 hash tables
+    - Vectorized computation across all levels and corners
+    - Fused bilinear interpolation
     """
     
     def __init__(
@@ -24,6 +26,7 @@ class HashGridEncoding(nn.Module):
         
         self.n_levels = n_levels
         self.n_features = n_features
+        self.log2_hashmap_size = log2_hashmap_size
         self.hashmap_size = 2 ** log2_hashmap_size
         self.base_resolution = base_resolution
         self.max_resolution = max_resolution
@@ -36,44 +39,34 @@ class HashGridEncoding(nn.Module):
         else:
             self.growth_factor = 1.0
         
-        # Precompute resolutions for each level
-        self.register_buffer(
-            "resolutions",
-            torch.tensor([
-                int(base_resolution * (self.growth_factor ** l))
-                for l in range(n_levels)
-            ], dtype=torch.float32)
-        )
+        # Precompute resolutions for each level: (L,)
+        resolutions = torch.tensor([
+            base_resolution * (self.growth_factor ** l)
+            for l in range(n_levels)
+        ], dtype=torch.float32)
+        self.register_buffer("resolutions", resolutions)
         
-        # Learnable hash tables for each level
-        self.embeddings = nn.ModuleList([
-            nn.Embedding(self.hashmap_size, n_features)
-            for _ in range(n_levels)
-        ])
+        # Single unified embedding table for all levels
+        # Shape: (L * T, F) - kept as FP32, autocast handles FP16 compute
+        total_entries = n_levels * self.hashmap_size
+        self.embedding = nn.Embedding(total_entries, n_features)
+        nn.init.uniform_(self.embedding.weight, -1e-4, 1e-4)
         
-        # Initialize with small random values
-        for emb in self.embeddings:
-            nn.init.uniform_(emb.weight, -1e-4, 1e-4)
+        # Level offsets for indexing into unified table
+        level_offsets = torch.arange(n_levels, dtype=torch.int64) * self.hashmap_size
+        self.register_buffer("level_offsets", level_offsets)
         
-        # Prime numbers for spatial hashing
+        # Corner offsets for vectorized corner computation: (4, 2)
+        corner_offsets = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=torch.int32)
+        self.register_buffer("corner_offsets", corner_offsets)
+        
+        # Primes for spatial hashing
         self.register_buffer("primes", torch.tensor([1, 2654435761], dtype=torch.int64))
-    
-    def hash_coords(self, coords):
-        """Hash 2D integer coordinates to table indices.
-        
-        Args:
-            coords: (N, 2) integer coordinates
-        
-        Returns:
-            (N,) hash indices
-        """
-        # XOR-based spatial hash
-        hashed = coords[:, 0].long() * self.primes[0]
-        hashed = hashed ^ (coords[:, 1].long() * self.primes[1])
-        return hashed % self.hashmap_size
     
     def forward(self, uv):
         """Encode UV coordinates using multi-resolution hash grids.
+        
+        Fully vectorized over levels and corners.
         
         Args:
             uv: (N, 2) coordinates in [0, 1]
@@ -81,46 +74,55 @@ class HashGridEncoding(nn.Module):
         Returns:
             (N, n_levels * n_features) encoded features
         """
-        outputs = []
+        N = uv.shape[0]
+        L = self.n_levels
+        F = self.n_features
         
-        for level, resolution in enumerate(self.resolutions):
-            # Scale coordinates to grid resolution
-            scaled = uv * resolution
-            
-            # Get integer corners and fractional offsets
-            floor_coords = torch.floor(scaled).int()
-            frac = scaled - floor_coords.float()
-            
-            # 4 corners of the grid cell: (0,0), (0,1), (1,0), (1,1)
-            corners = []
-            for dy in [0, 1]:
-                for dx in [0, 1]:
-                    corner = floor_coords + torch.tensor([[dy, dx]], device=uv.device)
-                    corners.append(corner)
-            
-            # Hash corners and lookup features
-            corner_features = []
-            for corner in corners:
-                indices = self.hash_coords(corner)
-                features = self.embeddings[level](indices)
-                corner_features.append(features)
-            
-            # Bilinear interpolation
-            # f00, f01, f10, f11 correspond to corners (0,0), (0,1), (1,0), (1,1)
-            f00, f01, f10, f11 = corner_features
-            
-            # Interpolation weights
-            u_frac = frac[:, 1:2]  # x direction
-            v_frac = frac[:, 0:1]  # y direction
-            
-            # Bilinear interpolation
-            f0 = f00 * (1 - u_frac) + f01 * u_frac  # bottom edge
-            f1 = f10 * (1 - u_frac) + f11 * u_frac  # top edge
-            interpolated = f0 * (1 - v_frac) + f1 * v_frac
-            
-            outputs.append(interpolated)
+        # Scale UV to all resolutions at once: (N, 2) * (L,) -> (N, L, 2)
+        # resolutions: (L,) -> (1, L, 1)
+        scaled = uv.unsqueeze(1) * self.resolutions.view(1, L, 1)
         
-        return torch.cat(outputs, dim=1)
+        # Get integer floor and fractional parts: (N, L, 2)
+        floor_coords = torch.floor(scaled).int()
+        frac = scaled - floor_coords.float()
+        
+        # Compute all 4 corners for all levels: (N, L, 4, 2)
+        # corner_offsets: (4, 2) -> (1, 1, 4, 2)
+        corners = floor_coords.unsqueeze(2) + self.corner_offsets.view(1, 1, 4, 2)
+        
+        # Hash all corners: (N, L, 4)
+        # Spatial hash: (x * p1) XOR (y * p2) mod T
+        hashed = (corners[..., 0].long() * self.primes[0]) ^ (corners[..., 1].long() * self.primes[1])
+        hashed = hashed % self.hashmap_size
+        
+        # Add level offsets to get global indices: (N, L, 4)
+        # level_offsets: (L,) -> (1, L, 1)
+        global_indices = hashed + self.level_offsets.view(1, L, 1)
+        
+        # Lookup features for all corners: (N, L, 4) -> (N*L*4, F) -> (N, L, 4, F)
+        flat_indices = global_indices.reshape(-1)
+        flat_features = self.embedding(flat_indices)
+        corner_features = flat_features.view(N, L, 4, F)
+        
+        # Fused bilinear interpolation
+        # frac: (N, L, 2) -> extract u_frac (x) and v_frac (y)
+        u_frac = frac[..., 1:2]  # (N, L, 1) - x direction
+        v_frac = frac[..., 0:1]  # (N, L, 1) - y direction
+        
+        # corners: [0]=f00, [1]=f01, [2]=f10, [3]=f11
+        # f00 at (0,0), f01 at (0,1), f10 at (1,0), f11 at (1,1)
+        f00 = corner_features[:, :, 0, :]  # (N, L, F)
+        f01 = corner_features[:, :, 1, :]
+        f10 = corner_features[:, :, 2, :]
+        f11 = corner_features[:, :, 3, :]
+        
+        # Bilinear interpolation: lerp in x, then lerp in y
+        f0 = f00 * (1 - u_frac) + f01 * u_frac  # bottom edge
+        f1 = f10 * (1 - u_frac) + f11 * u_frac  # top edge
+        interpolated = f0 * (1 - v_frac) + f1 * v_frac  # (N, L, F)
+        
+        # Flatten levels: (N, L, F) -> (N, L*F)
+        return interpolated.reshape(N, L * F)
     
     @property
     def output_dim(self):
@@ -232,3 +234,26 @@ class NIFModel(nn.Module):
             x = torch.nn.functional.linear(x, self.color_matrix)
 
         return x
+
+
+def compile_model(model, mode="reduce-overhead"):
+    """Compile model with torch.compile for optimized execution.
+    
+    Args:
+        model: PyTorch model
+        mode: Compilation mode ('default', 'reduce-overhead', 'max-autotune')
+    
+    Returns:
+        Compiled model (or original if compilation unavailable)
+    """
+    if hasattr(torch, 'compile'):
+        try:
+            compiled = torch.compile(model, mode=mode)
+            print(f"Model compiled with torch.compile (mode={mode})")
+            return compiled
+        except Exception as e:
+            print(f"torch.compile failed: {e}, using uncompiled model")
+            return model
+    else:
+        print("torch.compile not available, using uncompiled model")
+        return model

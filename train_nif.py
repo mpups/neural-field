@@ -74,7 +74,7 @@ def parse_args():
     )
     # Hash grid encoding options
     parser.add_argument(
-        "--hashgrid-levels", type=int, default=16,
+        "--hashgrid-levels", type=int, default=12,
         help="Number of resolution levels (hashgrid encoding only)."
     )
     parser.add_argument(
@@ -82,15 +82,20 @@ def parse_args():
         help="Features per hash table entry (hashgrid encoding only)."
     )
     parser.add_argument(
-        "--hashgrid-log2-size", type=int, default=19,
-        help="Log2 of hash table size (hashgrid encoding only)."
+        "--hashgrid-log2-size", type=int, default=0,
+        help="Log2 of hash table size per level (0=auto based on image size). "
+             "14=16K, 15=32K, 16=64K entries."
+    )
+    parser.add_argument(
+        "--compression-ratio", type=float, default=4.0,
+        help="Target compression ratio for auto hash table sizing."
     )
     parser.add_argument(
         "--hashgrid-base-res", type=int, default=16,
         help="Base (coarsest) resolution (hashgrid encoding only)."
     )
     parser.add_argument(
-        "--hashgrid-max-res", type=int, default=2048,
+        "--hashgrid-max-res", type=int, default=1024,
         help="Maximum (finest) resolution (hashgrid encoding only)."
     )
     parser.add_argument(
@@ -130,6 +135,15 @@ def parse_args():
     parser.add_argument(
         "--num-workers", type=int, default=0,
         help="Number of DataLoader worker processes."
+    )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Use torch.compile for optimized execution."
+    )
+    parser.add_argument(
+        "--compile-mode", type=str, default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode."
     )
     args = parser.parse_args()
     return args
@@ -202,6 +216,7 @@ if __name__ == "__main__":
         loss_fn = nn.HuberLoss(delta=0.001, reduction="mean")
 
     # Encoding setup
+    log2_size = args.hashgrid_log2_size  # Will be updated if auto-calculated
     if args.encoding == "fourier":
         # Fourier: apply fixed encoding as preprocessing
         embedding_dimension = args.embedding_dimension
@@ -215,16 +230,38 @@ if __name__ == "__main__":
         embedding_dimension = 0  # Not used for hash grid
         train_uv_encoded = train_uv
         input_dim = 2  # Raw UV
+        
+        # Auto-calculate hash table size if not specified
+        log2_size = args.hashgrid_log2_size
+        if log2_size == 0:
+            # Target model size based on compression ratio
+            image_bytes = height * width * 3 * 4  # FP32 image
+            target_bytes = image_bytes / args.compression_ratio
+            
+            # Estimate MLP params (rough: 2 * layer_size^2)
+            mlp_bytes = 2 * args.layer_size * args.layer_size * 4
+            hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
+            
+            # entries = bytes / (4 bytes * n_features)
+            total_entries = hash_bytes / (4 * args.hashgrid_features)
+            entries_per_level = total_entries / args.hashgrid_levels
+            log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
+            
+            print(f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
+                  f"for {args.compression_ratio}:1 target compression")
+        
         encoding_module = nif_model.HashGridEncoding(
             n_levels=args.hashgrid_levels,
             n_features=args.hashgrid_features,
-            log2_hashmap_size=args.hashgrid_log2_size,
+            log2_hashmap_size=log2_size,
             base_resolution=args.hashgrid_base_res,
             max_resolution=args.hashgrid_max_res,
         ).to(device)
+        
+        total_hash_params = args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
         print(f"Hash grid encoding: {args.hashgrid_levels} levels, "
-              f"{2**args.hashgrid_log2_size} entries/level, "
-              f"{args.hashgrid_features} features/entry")
+              f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
+              f"{total_hash_params:,} hash params")
 
     # Create dataset and dataloader
     dataset = TensorDataset(train_uv_encoded.cpu(), train_values.cpu())
@@ -255,13 +292,17 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model_obj.parameters())
     print(f"Total parameters: {total_params:,}")
 
+    # Compile model if requested
+    if args.compile:
+        model_obj = nif_model.compile_model(model_obj, mode=args.compile_mode)
+
     optimizer = optim.Adam(model_obj.parameters(), lr=args.learning_rate)
 
     # Mixed precision (CUDA only)
     use_fp16 = args.fp16 and device.type == "cuda"
     if args.fp16 and device.type != "cuda":
         print("WARNING: --fp16 ignored on non-CUDA device")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16) if use_fp16 else None
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16) if use_fp16 else None
 
     # Evaluation callback
     eval_callback = nif.EvalCallback(
@@ -360,7 +401,7 @@ if __name__ == "__main__":
                         "hashgrid_config": {
                             "n_levels": args.hashgrid_levels,
                             "n_features": args.hashgrid_features,
-                            "log2_hashmap_size": args.hashgrid_log2_size,
+                            "log2_hashmap_size": log2_size,
                             "base_resolution": args.hashgrid_base_res,
                             "max_resolution": args.hashgrid_max_res,
                         } if args.encoding == "hashgrid" else None,
@@ -387,7 +428,7 @@ if __name__ == "__main__":
                 "hashgrid_config": {
                     "n_levels": args.hashgrid_levels,
                     "n_features": args.hashgrid_features,
-                    "log2_hashmap_size": args.hashgrid_log2_size,
+                    "log2_hashmap_size": log2_size,
                     "base_resolution": args.hashgrid_base_res,
                     "max_resolution": args.hashgrid_max_res,
                 } if args.encoding == "hashgrid" else None,
