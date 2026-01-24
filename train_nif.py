@@ -61,26 +61,6 @@ def parse_args():
         default=1024*1024,
         help="The number of image samples used to train the NIF.",
     )
-    parser.add_argument(
-        "--encoding",
-        type=str,
-        default="fourier",
-        choices=["fourier", "hashgrid"],
-        help="Input encoding type: fourier (fixed) or hashgrid (learnable).",
-    )
-    # Fourier encoding options
-    parser.add_argument(
-        "--embedding-dimension",
-        type=int,
-        default=10,
-        help="Dimension of Fourier position embedding (fourier encoding only).",
-    )
-    parser.add_argument(
-        "--embedding-sigma",
-        type=float,
-        default=2.0,
-        help="Base for Fourier positional embedding.",
-    )
     # Hash grid encoding options
     parser.add_argument(
         "--hashgrid-levels",
@@ -238,57 +218,38 @@ if __name__ == "__main__":
     else:
         loss_fn = nn.HuberLoss(delta=0.001, reduction="mean")
 
-    # Encoding setup
-    log2_size = args.hashgrid_log2_size  # Will be updated if auto-calculated
-    if args.encoding == "fourier":
-        # Fourier: apply fixed encoding as preprocessing
-        embedding_dimension = args.embedding_dimension
-        input_dim = 4 * embedding_dimension  # sin/cos for u and v
-        encoding_module = None
+    # Hash grid encoding setup
+    log2_size = args.hashgrid_log2_size
+    input_dim = 2  # Raw UV
+
+    # Auto-calculate hash table size if not specified
+    if log2_size == 0:
+        image_bytes = height * width * 3 * 4  # FP32 image
+        target_bytes = image_bytes / args.compression_ratio
+        mlp_bytes = 2 * args.layer_size * args.layer_size * 4
+        hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
+        total_entries = hash_bytes / (4 * args.hashgrid_features)
+        entries_per_level = total_entries / args.hashgrid_levels
+        log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
         print(
-            f"Fourier encoding: dimension={embedding_dimension}, input_dim={input_dim}"
+            f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
+            f"for {args.compression_ratio}:1 target compression"
         )
-    else:
-        # Hash grid: encoding is part of model, pass raw UV
-        embedding_dimension = 0  # Not used for hash grid
-        input_dim = 2  # Raw UV
 
-        # Auto-calculate hash table size if not specified
-        if log2_size == 0:
-            # Target model size based on compression ratio
-            image_bytes = height * width * 3 * 4  # FP32 image
-            target_bytes = image_bytes / args.compression_ratio
+    encoding_module = nif_model.HashGridEncoding(
+        n_levels=args.hashgrid_levels,
+        n_features=args.hashgrid_features,
+        log2_hashmap_size=log2_size,
+        base_resolution=args.hashgrid_base_res,
+        max_resolution=args.hashgrid_max_res,
+    ).to(device)
 
-            # Estimate MLP params (rough: 2 * layer_size^2)
-            mlp_bytes = 2 * args.layer_size * args.layer_size * 4
-            hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
-
-            # entries = bytes / (4 bytes * n_features)
-            total_entries = hash_bytes / (4 * args.hashgrid_features)
-            entries_per_level = total_entries / args.hashgrid_levels
-            log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
-
-            print(
-                f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
-                f"for {args.compression_ratio}:1 target compression"
-            )
-
-        encoding_module = nif_model.HashGridEncoding(
-            n_levels=args.hashgrid_levels,
-            n_features=args.hashgrid_features,
-            log2_hashmap_size=log2_size,
-            base_resolution=args.hashgrid_base_res,
-            max_resolution=args.hashgrid_max_res,
-        ).to(device)
-
-        total_hash_params = (
-            args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
-        )
-        print(
-            f"Hash grid encoding: {args.hashgrid_levels} levels, "
-            f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
-            f"{total_hash_params:,} hash params"
-        )
+    total_hash_params = args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
+    print(
+        f"Hash grid encoding: {args.hashgrid_levels} levels, "
+        f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
+        f"{total_hash_params:,} hash params"
+    )
 
     # Helper to generate training data (samples from GPU image tensor)
     def generate_training_data():
@@ -298,10 +259,6 @@ if __name__ == "__main__":
             uv = nif.stochastic_uv_samples(sample_count, device)
 
         values = nif.sample_image(img_tensor, uv)
-
-        if args.encoding == "fourier":
-            uv = nif.uv_positional_encode(uv, embedding_dimension, args.embedding_sigma)
-
         return uv, values
 
     # Initial dataset
@@ -345,10 +302,7 @@ if __name__ == "__main__":
         args=sys.argv,
         shape=img.shape,
         encode_params=encode_params,
-        embedding_dim=embedding_dimension,
-        embedding_sigma=args.embedding_sigma,
         model_path=args.model,
-        encoding_type=args.encoding,
     )
 
     # Training loop
@@ -436,18 +390,13 @@ if __name__ == "__main__":
                         "layer_size": args.layer_size,
                         "num_layers": args.layer_count,
                         "color_matrix": color_matrix,
-                        "encoding_type": args.encoding,
-                        "hashgrid_config": (
-                            {
-                                "n_levels": args.hashgrid_levels,
-                                "n_features": args.hashgrid_features,
-                                "log2_hashmap_size": log2_size,
-                                "base_resolution": args.hashgrid_base_res,
-                                "max_resolution": args.hashgrid_max_res,
-                            }
-                            if args.encoding == "hashgrid"
-                            else None
-                        ),
+                        "hashgrid_config": {
+                            "n_levels": args.hashgrid_levels,
+                            "n_features": args.hashgrid_features,
+                            "log2_hashmap_size": log2_size,
+                            "base_resolution": args.hashgrid_base_res,
+                            "max_resolution": args.hashgrid_max_res,
+                        },
                     },
                 },
                 model_pt_path,
@@ -467,18 +416,13 @@ if __name__ == "__main__":
                 "layer_size": args.layer_size,
                 "num_layers": args.layer_count,
                 "color_matrix": color_matrix,
-                "encoding_type": args.encoding,
-                "hashgrid_config": (
-                    {
-                        "n_levels": args.hashgrid_levels,
-                        "n_features": args.hashgrid_features,
-                        "log2_hashmap_size": log2_size,
-                        "base_resolution": args.hashgrid_base_res,
-                        "max_resolution": args.hashgrid_max_res,
-                    }
-                    if args.encoding == "hashgrid"
-                    else None
-                ),
+                "hashgrid_config": {
+                    "n_levels": args.hashgrid_levels,
+                    "n_features": args.hashgrid_features,
+                    "log2_hashmap_size": log2_size,
+                    "base_resolution": args.hashgrid_base_res,
+                    "max_resolution": args.hashgrid_max_res,
+                },
             },
         },
         final_model_path,
@@ -491,10 +435,7 @@ if __name__ == "__main__":
         model=model_obj,
         device=device,
         img_shape=img.shape,
-        embedding_dimension=embedding_dimension,
-        embedding_sigma=args.embedding_sigma,
         encode_params=encode_params,
-        encoding_type=args.encoding,
     )
     psnr = nif.compute_psnr(args.input, reconstructed)
     if psnr:

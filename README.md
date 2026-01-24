@@ -1,8 +1,7 @@
 # Neural Image Fields
 
-A neural image field (NIF) learns to represent a 2D image as a continuous function mapping pixel coordinates to colour values.
-A small neural network is trained as a function approximator using positional encoding (Fourier features) to capture high-frequency detail.
-With careful choice of parameters this is a form of neural image compression.
+Uses a hashgrid encoding (as in instant NGP) and small neural network trained as a function approximator to go from pixel
+coordinates to colour values. With careful choice of parameters this is a form of neural image compression.
 
 ## Quick Start
 

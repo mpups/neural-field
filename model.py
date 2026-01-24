@@ -137,8 +137,7 @@ class HashGridEncoding(nn.Module):
 class NIFModel(nn.Module):
     """Neural Image Field Model - MLP for image compression/reconstruction.
 
-    Supports Fourier positional encoding (input preprocessing) or learnable
-    hash grid encoding (integrated in model).
+    Uses learnable hash grid encoding integrated in the model.
     """
 
     def __init__(
@@ -151,12 +150,11 @@ class NIFModel(nn.Module):
     ):
         """
         Args:
-            input_dim: Input dimension (2 for raw UV with hash encoding,
-                       or 4*embedding_dim for Fourier encoding)
+            input_dim: Input dimension (2 for raw UV)
             layer_size: Hidden layer width
             num_layers: Number of MLP layers
             color_matrix: Optional color space conversion matrix
-            encoding: Optional HashGridEncoding module (for hash grid mode)
+            encoding: HashGridEncoding module
         """
         super().__init__()
 

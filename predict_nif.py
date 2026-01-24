@@ -3,7 +3,6 @@
 import torch
 import argparse
 import cv2
-import numpy as np
 import nif
 import model as nif_model
 import os
@@ -67,10 +66,7 @@ if __name__ == "__main__":
     print(f"NIF metadata loaded from: {metadata_path}")
 
     img_shape = metadata["original_image_shape"]
-    embedding_dimension = metadata["embedding_dimension"]
-    embedding_sigma = metadata["embedding_sigma"]
     encode_params = metadata["encode_params"]
-    encoding_type = metadata.get("encoding_type", "fourier")
 
     if args.width == 0 or args.height == 0:
         width = img_shape[1]
@@ -90,17 +86,15 @@ if __name__ == "__main__":
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     model_config = checkpoint.get("model_config", {})
 
-    # Create encoding module if needed
-    encoding_module = None
-    if encoding_type == "hashgrid":
-        hashgrid_config = model_config.get("hashgrid_config", {})
-        encoding_module = nif_model.HashGridEncoding(
-            n_levels=hashgrid_config.get("n_levels", 16),
-            n_features=hashgrid_config.get("n_features", 2),
-            log2_hashmap_size=hashgrid_config.get("log2_hashmap_size", 19),
-            base_resolution=hashgrid_config.get("base_resolution", 16),
-            max_resolution=hashgrid_config.get("max_resolution", 2048),
-        ).to(device)
+    # Create hash grid encoding module
+    hashgrid_config = model_config.get("hashgrid_config", {})
+    encoding_module = nif_model.HashGridEncoding(
+        n_levels=hashgrid_config.get("n_levels", 16),
+        n_features=hashgrid_config.get("n_features", 2),
+        log2_hashmap_size=hashgrid_config.get("log2_hashmap_size", 19),
+        base_resolution=hashgrid_config.get("base_resolution", 16),
+        max_resolution=hashgrid_config.get("max_resolution", 2048),
+    ).to(device)
 
     model = nif_model.NIFModel(
         input_dim=model_config.get("input_dim"),
@@ -114,7 +108,6 @@ if __name__ == "__main__":
     model.eval()
 
     print(f"Model loaded from: {model_path}")
-    print(f"Encoding type: {encoding_type}")
     print(f"Generating {width}x{height} image...")
 
     # Run inference
@@ -122,11 +115,8 @@ if __name__ == "__main__":
         model=model,
         device=device,
         img_shape=tuple(img_shape),
-        embedding_dimension=embedding_dimension,
-        embedding_sigma=embedding_sigma,
         encode_params=encode_params,
         batch_size=args.batch_size,
-        encoding_type=encoding_type,
     )
 
     cv2.imwrite(args.output, reconstructed)

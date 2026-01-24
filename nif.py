@@ -5,7 +5,6 @@ import cv2
 import numpy as np
 import json
 import os
-import time
 
 
 def value_stats(values):
@@ -250,91 +249,21 @@ def decode_samples(image_shape, uv, values, params):
     return output
 
 
-def make_prediction_dataset(
-    width, height, embedding_dimension, embedding_sigma, device
-):
-    """Create grid of UV coordinates for full image prediction.
-
-    Args:
-        width: Image width
-        height: Image height
-        embedding_dimension: Positional encoding dimension (0 to disable)
-        embedding_sigma: Positional encoding sigma
-        device: torch.device
-
-    Returns:
-        uv_coords: (H*W, D) tensor of (optionally encoded) UV coordinates
-        pixel_coords: (H*W, 2) tensor of pixel coordinates
-    """
-    pixel_coords, uv_coords = make_image_grid(width, height, device)
-
-    if embedding_dimension > 0:
-        uv_coords = uv_positional_encode(
-            uv_coords, embedding_dimension, embedding_sigma
-        )
-
-    print(f"Prediction dataset shape: {uv_coords.shape}")
-    return uv_coords, pixel_coords
-
-
-def uv_positional_encode(uv, dimension, sigma):
-    """NERF-style positional encoding of UV coordinates (vectorized).
-
-    Args:
-        uv: (N, 2) tensor of UV coordinates
-        dimension: Number of frequency bands
-        sigma: Base for frequency progression
-
-    Returns:
-        (N, 4*dimension) tensor of encoded coordinates
-    """
-    device = uv.device
-
-    powers = torch.arange(0.0, dimension, 1.0, device=device)
-    coeffs = torch.pow(sigma, powers)
-
-    uv_scaled = 2 * (uv - 1.0)
-
-    u_scaled = uv_scaled[:, 0:1]
-    v_scaled = uv_scaled[:, 1:2]
-
-    u_freq = u_scaled * coeffs
-    v_freq = v_scaled * coeffs
-
-    encoded = torch.cat(
-        [
-            torch.sin(u_freq),
-            torch.sin(v_freq),
-            torch.cos(u_freq),
-            torch.cos(v_freq),
-        ],
-        dim=1,
-    )
-
-    return encoded
-
-
 def save_metadata(
     file_name,
     name,
     args,
     shape,
     encode_params,
-    embedding_dim,
-    embedding_sigma,
     model_path,
-    encoding_type="fourier",
 ):
     """Save training metadata alongside model."""
     nif_params = {
         "name": name,
         "train_command": args,
         "original_image_shape": list(shape),
-        "embedding_dimension": embedding_dim,
-        "embedding_sigma": embedding_sigma,
         "pytorch_model": model_path,
         "encode_params": encode_params,
-        "encoding_type": encoding_type,
     }
     os.makedirs(os.path.dirname(file_name), exist_ok=True)
     with open(file_name, "w") as file:
@@ -416,38 +345,25 @@ def run_inference(
     model,
     device,
     img_shape,
-    embedding_dimension,
-    embedding_sigma,
     encode_params,
     batch_size=2048,
-    encoding_type="fourier",
 ):
     """Run full-image inference using the model.
 
     Args:
-        model: PyTorch model (already on device)
+        model: PyTorch model (already on device, includes hash grid encoding)
         device: torch.device
         img_shape: Original image shape (H, W, C)
-        embedding_dimension: Positional encoding dimension (fourier only)
-        embedding_sigma: Positional encoding sigma (fourier only)
         encode_params: Encoding parameters from training
         batch_size: Inference batch size
-        encoding_type: 'fourier' or 'hashgrid'
 
     Returns:
         Reconstructed image as numpy array
     """
     height, width = img_shape[0], img_shape[1]
 
-    if encoding_type == "hashgrid":
-        # Hash grid: model handles encoding, pass raw UV
-        _, uv_coords = make_image_grid(width, height, device)
-        pixel_coords, _ = make_image_grid(width, height, device)
-    else:
-        # Fourier: apply fixed encoding
-        uv_coords, pixel_coords = make_prediction_dataset(
-            width, height, embedding_dimension, embedding_sigma, device
-        )
+    # Model handles encoding internally, pass raw UV
+    pixel_coords, uv_coords = make_image_grid(width, height, device)
 
     output_samples = []
 
@@ -471,66 +387,4 @@ def run_inference(
     return reconstructed
 
 
-class EvalCallback:
-    """Callback for periodic evaluation during training."""
 
-    def __init__(
-        self,
-        model,
-        device,
-        original_file,
-        img_shape,
-        embedding_dimension,
-        embedding_sigma,
-        encode_params,
-        period,
-        compute_psnr_flag=True,
-        batch_size=2048,
-        encoding_type="fourier",
-    ):
-        self.model = model
-        self.device = device
-        self.input_file = original_file
-        self.img_shape = img_shape
-        self.embedding_dimension = embedding_dimension
-        self.embedding_sigma = embedding_sigma
-        self.encode_params = encode_params
-        self.period = period
-        self.compute_psnr_flag = compute_psnr_flag
-        self.batch_size = batch_size
-        self.encoding_type = encoding_type
-        self.epoch_start_time = None
-
-    def on_epoch_begin(self, epoch):
-        """Called at start of epoch."""
-        self.epoch_start_time = time.time()
-
-    def on_epoch_end(self, epoch, loss=None):
-        """Called at end of epoch."""
-        epoch_time = time.time() - self.epoch_start_time
-
-        if loss is not None:
-            print(f"Epoch {epoch}: {epoch_time:.2f}s, loss={loss:.6f}", end="")
-        else:
-            print(f"Epoch {epoch}: {epoch_time:.2f}s", end="")
-
-        if epoch % self.period == 0 and self.compute_psnr_flag:
-            reconstructed = run_inference(
-                self.model,
-                self.device,
-                self.img_shape,
-                self.embedding_dimension,
-                self.embedding_sigma,
-                self.encode_params,
-                self.batch_size,
-                self.encoding_type,
-            )
-
-            psnr = compute_psnr(self.input_file, reconstructed)
-            if psnr:
-                print(
-                    f" | PSNR RGB={psnr['rgb']:.2f} L={psnr['l']:.2f} AB={psnr['ab']:.2f}",
-                    end="",
-                )
-
-        print()
