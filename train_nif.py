@@ -42,23 +42,23 @@ def parse_args():
     parser.add_argument(
         "--learning-rate", type=float, default=0.001, help="The learning rate for ADAM."
     )
-    parser.add_argument("--batch-size", type=int, default=8192, help="The batch size.")
+    parser.add_argument("--batch-size", type=int, default=1024*1024, help="The batch size.")
     parser.add_argument(
-        "--epochs", type=int, default=2000, help="Total number of epochs to train for."
+        "--epochs", type=int, default=100, help="Total number of epochs to train for."
     )
     parser.add_argument(
-        "--layer-size", type=int, default=256, help="Hidden size of the MLPs."
+        "--layer-size", type=int, default=64, help="Hidden size of the MLPs."
     )
     parser.add_argument(
         "--layer-count",
         type=int,
-        default=6,
+        default=2,
         help="Number of MLP layers. Should be multiple of 2 for >= 4 layers.",
     )
     parser.add_argument(
         "--train-samples",
         type=int,
-        default=1000000,
+        default=1024*1024,
         help="The number of image samples used to train the NIF.",
     )
     parser.add_argument(
@@ -104,7 +104,7 @@ def parse_args():
     parser.add_argument(
         "--compression-ratio",
         type=float,
-        default=4.0,
+        default=8.0,
         help="Target compression ratio for auto hash table sizing.",
     )
     parser.add_argument(
