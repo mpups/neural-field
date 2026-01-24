@@ -286,6 +286,7 @@ def save_metadata(
     embedding_dim,
     embedding_sigma,
     model_path,
+    encoding_type="fourier",
 ):
     """Save training metadata alongside model."""
     nif_params = {
@@ -296,6 +297,7 @@ def save_metadata(
         "embedding_sigma": embedding_sigma,
         "pytorch_model": model_path,
         "encode_params": encode_params,
+        "encoding_type": encoding_type,
     }
     os.makedirs(os.path.dirname(file_name), exist_ok=True)
     with open(file_name, "w") as file:
@@ -381,6 +383,7 @@ def run_inference(
     embedding_sigma,
     encode_params,
     batch_size=2048,
+    encoding_type="fourier",
 ):
     """Run full-image inference using the model.
 
@@ -388,19 +391,26 @@ def run_inference(
         model: PyTorch model (already on device)
         device: torch.device
         img_shape: Original image shape (H, W, C)
-        embedding_dimension: Positional encoding dimension
-        embedding_sigma: Positional encoding sigma
+        embedding_dimension: Positional encoding dimension (fourier only)
+        embedding_sigma: Positional encoding sigma (fourier only)
         encode_params: Encoding parameters from training
         batch_size: Inference batch size
+        encoding_type: 'fourier' or 'hashgrid'
 
     Returns:
         Reconstructed image as numpy array
     """
     height, width = img_shape[0], img_shape[1]
 
-    uv_coords, pixel_coords = make_prediction_dataset(
-        width, height, embedding_dimension, embedding_sigma, device
-    )
+    if encoding_type == "hashgrid":
+        # Hash grid: model handles encoding, pass raw UV
+        _, uv_coords = make_image_grid(width, height, device)
+        pixel_coords, _ = make_image_grid(width, height, device)
+    else:
+        # Fourier: apply fixed encoding
+        uv_coords, pixel_coords = make_prediction_dataset(
+            width, height, embedding_dimension, embedding_sigma, device
+        )
 
     output_samples = []
 
@@ -439,6 +449,7 @@ class EvalCallback:
         period,
         compute_psnr_flag=True,
         batch_size=2048,
+        encoding_type="fourier",
     ):
         self.model = model
         self.device = device
@@ -450,6 +461,7 @@ class EvalCallback:
         self.period = period
         self.compute_psnr_flag = compute_psnr_flag
         self.batch_size = batch_size
+        self.encoding_type = encoding_type
         self.epoch_start_time = None
 
     def on_epoch_begin(self, epoch):
@@ -474,6 +486,7 @@ class EvalCallback:
                 self.embedding_sigma,
                 self.encode_params,
                 self.batch_size,
+                self.encoding_type,
             )
 
             psnr = compute_psnr(self.input_file, reconstructed)
