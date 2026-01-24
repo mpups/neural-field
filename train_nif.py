@@ -125,15 +125,10 @@ def parse_args():
         help="Create training data from one uv sample per pixel.",
     )
     parser.add_argument(
-        "--disable-psnr",
-        action="store_true",
-        help="Disable PSNR evaluation during training.",
-    )
-    parser.add_argument(
-        "--callback-period",
+        "--checkpoint-period",
         type=int,
-        default=1000,
-        help="Interval in epochs for logging and PSNR evaluation.",
+        default=0,
+        help="Save checkpoints every N epochs (0=only at end).",
     )
     parser.add_argument(
         "--single-step", action="store_true", help="Execute a single step then exit."
@@ -342,20 +337,6 @@ if __name__ == "__main__":
         print("WARNING: --fp16 ignored on non-CUDA device")
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16) if use_fp16 else None
 
-    # Evaluation callback
-    eval_callback = nif.EvalCallback(
-        model=model_obj,
-        device=device,
-        original_file=args.input,
-        img_shape=img.shape,
-        embedding_dimension=embedding_dimension,
-        embedding_sigma=args.embedding_sigma,
-        encode_params=encode_params,
-        period=args.callback_period,
-        compute_psnr_flag=not args.disable_psnr,
-        encoding_type=args.encoding,
-    )
-
     # Save metadata
     metadata_file = nif.metadata_path_from_model_path(args.model)
     nif.save_metadata(
@@ -379,9 +360,9 @@ if __name__ == "__main__":
     if not args.deterministic_samples:
         print("Stochastic mode: regenerating samples each epoch")
 
+    epoch_start_time = time.time()
     for epoch in range(num_epochs):
         model_obj.train()
-        eval_callback.on_epoch_begin(epoch)
 
         # Regenerate samples each epoch for stochastic mode
         if not args.deterministic_samples and epoch > 0:
@@ -424,11 +405,16 @@ if __name__ == "__main__":
                 break
 
         avg_loss = epoch_loss / max(num_batches, 1)
-        eval_callback.on_epoch_end(epoch, loss=avg_loss)
+        epoch_time = time.time() - epoch_start_time
+        print(f"Epoch {epoch}: {epoch_time:.2f}s, loss={avg_loss:.6f}")
         sys.stdout.flush()
+        epoch_start_time = time.time()
 
         # Save checkpoint periodically
-        if (epoch + 1) % args.callback_period == 0 or epoch == num_epochs - 1:
+        should_save = (
+            args.checkpoint_period > 0 and (epoch + 1) % args.checkpoint_period == 0
+        )
+        if should_save:
             os.makedirs(args.model, exist_ok=True)
             checkpoint_path = os.path.join(args.model, f"checkpoint_epoch_{epoch}.pt")
             torch.save(
@@ -498,3 +484,18 @@ if __name__ == "__main__":
         final_model_path,
     )
     print(f"Training complete. Model saved to {final_model_path}")
+
+    # Final PSNR evaluation
+    print("\nEvaluating final PSNR...")
+    reconstructed = nif.run_inference(
+        model=model_obj,
+        device=device,
+        img_shape=img.shape,
+        embedding_dimension=embedding_dimension,
+        embedding_sigma=args.embedding_sigma,
+        encode_params=encode_params,
+        encoding_type=args.encoding,
+    )
+    psnr = nif.compute_psnr(args.input, reconstructed)
+    if psnr:
+        print(f"PSNR RGB={psnr['rgb']:.2f} L={psnr['l']:.2f} AB={psnr['ab']:.2f}")
