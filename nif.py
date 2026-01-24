@@ -114,22 +114,20 @@ def bilinear_interpolate(img, coords):
     return wa * Ia + wb * Ib + wc * Ic + wd * Id
 
 
-def encode_samples(image, uv_coords, transfer_function, device, debug_filename=""):
-    """Encode image values at UV sample coordinates.
+def prepare_image_for_sampling(image, transfer_function, device):
+    """Prepare image tensor for repeated sampling.
+
+    Call once at start of training to get a GPU tensor and encoding params.
 
     Args:
         image: numpy array (H, W, C)
-        uv_coords: (N, 2) tensor of UV coordinates
         transfer_function: 'linear' or 'log'
         device: torch.device
-        debug_filename: optional path to save debug image
 
     Returns:
-        train_values: (N, C) tensor of encoded sample values
+        img_tensor: Normalized image tensor on device
         encode_params: dict with encoding parameters for decoding
     """
-    height, width = image.shape[0], image.shape[1]
-
     img_tensor = torch.from_numpy(image.astype(np.float32)).to(device)
 
     max_value = img_tensor.max().item()
@@ -146,10 +144,6 @@ def encode_samples(image, uv_coords, transfer_function, device, debug_filename="
         max_value = 1.0
     img_tensor = img_tensor / max_value
 
-    remap_coords = uv_coords * torch.tensor([height - 1, width - 1], device=device)
-
-    train_values = bilinear_interpolate(img_tensor, remap_coords)
-
     encode_params = {
         "mean": mean_value.cpu().tolist(),
         "max": float(max_value),
@@ -158,7 +152,50 @@ def encode_samples(image, uv_coords, transfer_function, device, debug_filename="
         "eps": eps,
     }
 
+    return img_tensor, encode_params
+
+
+def sample_image(img_tensor, uv_coords):
+    """Sample from a prepared image tensor at UV coordinates.
+
+    Args:
+        img_tensor: Prepared image tensor from prepare_image_for_sampling
+        uv_coords: (N, 2) tensor of UV coordinates in [0, 1]
+
+    Returns:
+        (N, C) tensor of sampled values
+    """
+    height, width = img_tensor.shape[0], img_tensor.shape[1]
+    device = img_tensor.device
+
+    remap_coords = uv_coords * torch.tensor([height - 1, width - 1], device=device)
+    return bilinear_interpolate(img_tensor, remap_coords)
+
+
+def encode_samples(image, uv_coords, transfer_function, device, debug_filename=""):
+    """Encode image values at UV sample coordinates.
+
+    For repeated sampling, use prepare_image_for_sampling + sample_image instead.
+
+    Args:
+        image: numpy array (H, W, C)
+        uv_coords: (N, 2) tensor of UV coordinates
+        transfer_function: 'linear' or 'log'
+        device: torch.device
+        debug_filename: optional path to save debug image
+
+    Returns:
+        train_values: (N, C) tensor of encoded sample values
+        encode_params: dict with encoding parameters for decoding
+    """
+    img_tensor, encode_params = prepare_image_for_sampling(
+        image, transfer_function, device
+    )
+    train_values = sample_image(img_tensor, uv_coords)
+
     if debug_filename:
+        height, width = image.shape[0], image.shape[1]
+        remap_coords = uv_coords * torch.tensor([height - 1, width - 1], device=device)
         pixel_coords = torch.round(remap_coords).long()
         decoded = decode_samples(
             image.shape,
@@ -417,7 +454,7 @@ def run_inference(
     model.eval()
     with torch.no_grad():
         for i in range(0, uv_coords.shape[0], batch_size):
-            batch = uv_coords[i: i + batch_size]
+            batch = uv_coords[i : i + batch_size]
             batch_output = model(batch)
             output_samples.append(batch_output)
 

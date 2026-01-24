@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 import argparse
 import cv2
 import numpy as np
@@ -23,127 +22,159 @@ except ImportError:
 def parse_args():
     parser = argparse.ArgumentParser("Neural Image Field (NIF) Generator - PyTorch")
     parser.add_argument(
-        "--input", type=str, default="Mandrill_portrait_2_Berlin_Zoo.jpg",
-        help="Input image file name."
+        "--input",
+        type=str,
+        default="Mandrill_portrait_2_Berlin_Zoo.jpg",
+        help="Input image file name.",
     )
     parser.add_argument(
-        "--blur", type=int, default=0,
-        help="Size of Gaussian blur kernel applied to the input (0 to disable)."
+        "--blur",
+        type=int,
+        default=0,
+        help="Size of Gaussian blur kernel applied to the input (0 to disable).",
     )
     parser.add_argument(
-        "--model", type=str, default="./saved_model/",
-        help="Output path to save the trained NIF model."
+        "--model",
+        type=str,
+        default="./saved_model/",
+        help="Output path to save the trained NIF model.",
     )
     parser.add_argument(
-        "--learning-rate", type=float, default=0.001,
-        help="The learning rate for ADAM."
+        "--learning-rate", type=float, default=0.001, help="The learning rate for ADAM."
+    )
+    parser.add_argument("--batch-size", type=int, default=8192, help="The batch size.")
+    parser.add_argument(
+        "--epochs", type=int, default=2000, help="Total number of epochs to train for."
     )
     parser.add_argument(
-        "--batch-size", type=int, default=8192,
-        help="The batch size."
+        "--layer-size", type=int, default=256, help="Hidden size of the MLPs."
     )
     parser.add_argument(
-        "--epochs", type=int, default=2000,
-        help="Total number of epochs to train for."
+        "--layer-count",
+        type=int,
+        default=6,
+        help="Number of MLP layers. Should be multiple of 2 for >= 4 layers.",
     )
     parser.add_argument(
-        "--layer-size", type=int, default=256,
-        help="Hidden size of the MLPs."
+        "--train-samples",
+        type=int,
+        default=1000000,
+        help="The number of image samples used to train the NIF.",
     )
     parser.add_argument(
-        "--layer-count", type=int, default=6,
-        help="Number of MLP layers. Should be multiple of 2 for >= 4 layers."
-    )
-    parser.add_argument(
-        "--train-samples", type=int, default=1000000,
-        help="The number of image samples used to train the NIF."
-    )
-    parser.add_argument(
-        "--encoding", type=str, default="fourier",
+        "--encoding",
+        type=str,
+        default="fourier",
         choices=["fourier", "hashgrid"],
-        help="Input encoding type: fourier (fixed) or hashgrid (learnable)."
+        help="Input encoding type: fourier (fixed) or hashgrid (learnable).",
     )
     # Fourier encoding options
     parser.add_argument(
-        "--embedding-dimension", type=int, default=10,
-        help="Dimension of Fourier position embedding (fourier encoding only)."
+        "--embedding-dimension",
+        type=int,
+        default=10,
+        help="Dimension of Fourier position embedding (fourier encoding only).",
     )
     parser.add_argument(
-        "--embedding-sigma", type=float, default=2.0,
-        help="Base for Fourier positional embedding."
+        "--embedding-sigma",
+        type=float,
+        default=2.0,
+        help="Base for Fourier positional embedding.",
     )
     # Hash grid encoding options
     parser.add_argument(
-        "--hashgrid-levels", type=int, default=12,
-        help="Number of resolution levels (hashgrid encoding only)."
+        "--hashgrid-levels",
+        type=int,
+        default=12,
+        help="Number of resolution levels (hashgrid encoding only).",
     )
     parser.add_argument(
-        "--hashgrid-features", type=int, default=2,
-        help="Features per hash table entry (hashgrid encoding only)."
+        "--hashgrid-features",
+        type=int,
+        default=2,
+        help="Features per hash table entry (hashgrid encoding only).",
     )
     parser.add_argument(
-        "--hashgrid-log2-size", type=int, default=0,
+        "--hashgrid-log2-size",
+        type=int,
+        default=0,
         help="Log2 of hash table size per level (0=auto based on image size). "
-             "14=16K, 15=32K, 16=64K entries."
+        "14=16K, 15=32K, 16=64K entries.",
     )
     parser.add_argument(
-        "--compression-ratio", type=float, default=4.0,
-        help="Target compression ratio for auto hash table sizing."
+        "--compression-ratio",
+        type=float,
+        default=4.0,
+        help="Target compression ratio for auto hash table sizing.",
     )
     parser.add_argument(
-        "--hashgrid-base-res", type=int, default=16,
-        help="Base (coarsest) resolution (hashgrid encoding only)."
+        "--hashgrid-base-res",
+        type=int,
+        default=16,
+        help="Base (coarsest) resolution (hashgrid encoding only).",
     )
     parser.add_argument(
-        "--hashgrid-max-res", type=int, default=1024,
-        help="Maximum (finest) resolution (hashgrid encoding only)."
+        "--hashgrid-max-res",
+        type=int,
+        default=1024,
+        help="Maximum (finest) resolution (hashgrid encoding only).",
     )
     parser.add_argument(
-        "--deterministic-samples", action="store_true",
-        help="Create training data from one uv sample per pixel."
+        "--deterministic-samples",
+        action="store_true",
+        help="Create training data from one uv sample per pixel.",
     )
     parser.add_argument(
-        "--disable-psnr", action="store_true",
-        help="Disable PSNR evaluation during training."
+        "--disable-psnr",
+        action="store_true",
+        help="Disable PSNR evaluation during training.",
     )
     parser.add_argument(
-        "--callback-period", type=int, default=10,
-        help="Interval in epochs for logging and PSNR evaluation."
+        "--callback-period",
+        type=int,
+        default=1000,
+        help="Interval in epochs for logging and PSNR evaluation.",
     )
     parser.add_argument(
-        "--single-step", action="store_true",
-        help="Execute a single step then exit."
+        "--single-step", action="store_true", help="Execute a single step then exit."
     )
     parser.add_argument(
-        "--fp16", action="store_true",
-        help="Train in fp16 (mixed precision)."
+        "--fp16", action="store_true", help="Train in fp16 (mixed precision)."
     )
     parser.add_argument(
-        "--mse", action="store_true",
-        help="Use MSE loss instead of Huber loss."
+        "--mse", action="store_true", help="Use MSE loss instead of Huber loss."
     )
     parser.add_argument(
-        "--color-space", type=str, default="rgb",
+        "--color-space",
+        type=str,
+        default="rgb",
         choices=["rgb", "yuv", "ycocg"],
-        help="Color space for network output."
+        help="Color space for network output.",
     )
     parser.add_argument(
-        "--device", type=str, default="cuda",
+        "--device",
+        type=str,
+        default="cuda",
         choices=["cuda", "cpu"],
-        help="Device to train on."
+        help="Device to train on.",
     )
     parser.add_argument(
-        "--num-workers", type=int, default=0,
-        help="Number of DataLoader worker processes."
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader worker processes.",
     )
     parser.add_argument(
-        "--compile", action="store_true",
-        help="Use torch.compile for optimized execution."
+        "--compile",
+        action="store_true",
+        help="Use torch.compile for optimized execution.",
     )
     parser.add_argument(
-        "--compile-mode", type=str, default="reduce-overhead",
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
         choices=["default", "reduce-overhead", "max-autotune"],
-        help="torch.compile mode."
+        help="torch.compile mode.",
     )
     args = parser.parse_args()
     return args
@@ -153,7 +184,9 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.layer_count >= 4 and args.layer_count % 2:
-        raise ValueError("Layer count >= 4 must be a multiple of 2 (for skip connections).")
+        raise ValueError(
+            "Layer count >= 4 must be a multiple of 2 (for skip connections)."
+        )
 
     device = du.get_device(args.device)
 
@@ -171,20 +204,17 @@ if __name__ == "__main__":
     input_min = img.min().astype(float)
     input_max = img.max().astype(float)
 
-    print(f"Image loaded. Size: {img.shape} Type: {img.dtype} Mean: {input_mean} Min/max: {input_min}/{input_max}")
+    print(
+        f"Image loaded. Size: {img.shape} Type: {img.dtype} Mean: {input_mean} Min/max: {input_min}/{input_max}"
+    )
 
-    # Generate training UV samples
-    print(f"Generating samples on {device}...")
-    t_start = time.time()
-
+    # Sample count
     if args.deterministic_samples:
-        train_uv = nif.deterministic_uv_samples(img.shape, device)
-        sample_count = train_uv.shape[0]
+        sample_count = height * width
         print(f"Using deterministic samples: {sample_count}")
     else:
         sample_count = args.train_samples
-        train_uv = nif.stochastic_uv_samples(sample_count, device)
-        print(f"Generated {sample_count} stochastic samples in {time.time() - t_start:.2f}s")
+        print(f"Using {sample_count} stochastic samples (regenerated each epoch)")
 
     # Detect HDR and choose transfer function
     transfer_function = "linear"
@@ -196,18 +226,16 @@ if __name__ == "__main__":
             transfer_function = "log"
     else:
         _, file_extension = os.path.splitext(args.input)
-        if file_extension.lower() in ['.exr']:
+        if file_extension.lower() in [".exr"]:
             print("HDR input detected (by extension): using log transfer function")
             transfer_function = "log"
 
-    # Encode samples (bilinear interpolation)
-    _, file_extension = os.path.splitext(args.input)
-    debug_file = "input_samples" + file_extension
-    train_values, encode_params = nif.encode_samples(img, train_uv, transfer_function, device, debug_file)
+    # Prepare image tensor on GPU once (stays for entire training)
+    img_tensor, encode_params = nif.prepare_image_for_sampling(
+        img, transfer_function, device
+    )
+    print(f"Image tensor on GPU: {img_tensor.shape}, {img_tensor.device}")
     print(f"Encode params: {encode_params}")
-
-    max_encoded, mean_encoded = nif.value_stats(train_values)
-    print(f"Max value after encode: {max_encoded} mean after encode: {mean_encoded}")
 
     # Loss function
     if args.mse:
@@ -220,36 +248,36 @@ if __name__ == "__main__":
     if args.encoding == "fourier":
         # Fourier: apply fixed encoding as preprocessing
         embedding_dimension = args.embedding_dimension
-        t0 = time.time()
-        train_uv_encoded = nif.uv_positional_encode(train_uv, embedding_dimension, args.embedding_sigma)
-        print(f"UV Fourier encode time: {time.time() - t0:.2f}s")
-        input_dim = train_uv_encoded.shape[-1]
+        input_dim = 4 * embedding_dimension  # sin/cos for u and v
         encoding_module = None
+        print(
+            f"Fourier encoding: dimension={embedding_dimension}, input_dim={input_dim}"
+        )
     else:
         # Hash grid: encoding is part of model, pass raw UV
         embedding_dimension = 0  # Not used for hash grid
-        train_uv_encoded = train_uv
         input_dim = 2  # Raw UV
-        
+
         # Auto-calculate hash table size if not specified
-        log2_size = args.hashgrid_log2_size
         if log2_size == 0:
             # Target model size based on compression ratio
             image_bytes = height * width * 3 * 4  # FP32 image
             target_bytes = image_bytes / args.compression_ratio
-            
+
             # Estimate MLP params (rough: 2 * layer_size^2)
             mlp_bytes = 2 * args.layer_size * args.layer_size * 4
             hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
-            
+
             # entries = bytes / (4 bytes * n_features)
             total_entries = hash_bytes / (4 * args.hashgrid_features)
             entries_per_level = total_entries / args.hashgrid_levels
             log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
-            
-            print(f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
-                  f"for {args.compression_ratio}:1 target compression")
-        
+
+            print(
+                f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
+                f"for {args.compression_ratio}:1 target compression"
+            )
+
         encoding_module = nif_model.HashGridEncoding(
             n_levels=args.hashgrid_levels,
             n_features=args.hashgrid_features,
@@ -257,23 +285,33 @@ if __name__ == "__main__":
             base_resolution=args.hashgrid_base_res,
             max_resolution=args.hashgrid_max_res,
         ).to(device)
-        
-        total_hash_params = args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
-        print(f"Hash grid encoding: {args.hashgrid_levels} levels, "
-              f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
-              f"{total_hash_params:,} hash params")
 
-    # Create dataset and dataloader
-    dataset = TensorDataset(train_uv_encoded.cpu(), train_values.cpu())
+        total_hash_params = (
+            args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
+        )
+        print(
+            f"Hash grid encoding: {args.hashgrid_levels} levels, "
+            f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
+            f"{total_hash_params:,} hash params"
+        )
 
-    train_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,
-        pin_memory=device.type == "cuda"
-    )
+    # Helper to generate training data (samples from GPU image tensor)
+    def generate_training_data():
+        if args.deterministic_samples:
+            uv = nif.deterministic_uv_samples(img.shape, device)
+        else:
+            uv = nif.stochastic_uv_samples(sample_count, device)
+
+        values = nif.sample_image(img_tensor, uv)
+
+        if args.encoding == "fourier":
+            uv = nif.uv_positional_encode(uv, embedding_dimension, args.embedding_sigma)
+
+        return uv, values
+
+    # Initial dataset
+    train_uv_encoded, train_values = generate_training_data()
+    steps_per_epoch = sample_count // args.batch_size
 
     # Color space conversion
     color_matrix = nif.color_space_to_bgr_matrix(args.color_space)
@@ -334,20 +372,35 @@ if __name__ == "__main__":
 
     # Training loop
     num_epochs = 1 if args.single_step else args.epochs
-    steps_per_epoch = 1 if args.single_step else len(train_loader)
 
-    print(f"\nStarting training: {num_epochs} epochs, {steps_per_epoch} steps/epoch, device: {device}")
+    print(
+        f"\nStarting training: {num_epochs} epochs, {steps_per_epoch} steps/epoch, device: {device}"
+    )
+    if not args.deterministic_samples:
+        print("Stochastic mode: regenerating samples each epoch")
 
     for epoch in range(num_epochs):
         model_obj.train()
         eval_callback.on_epoch_begin(epoch)
 
+        # Regenerate samples each epoch for stochastic mode
+        if not args.deterministic_samples and epoch > 0:
+            train_uv_encoded, train_values = generate_training_data()
+
+        # Shuffle indices on GPU
+        perm = torch.randperm(train_uv_encoded.shape[0], device=device)
+        train_uv_shuffled = train_uv_encoded[perm]
+        train_values_shuffled = train_values[perm]
+
         epoch_loss = 0.0
         num_batches = 0
 
-        for batch_idx, (uv_batch, values_batch) in enumerate(train_loader):
-            uv_batch = uv_batch.to(device)
-            values_batch = values_batch.to(device)
+        for batch_idx in range(steps_per_epoch):
+            start_idx = batch_idx * args.batch_size
+            end_idx = start_idx + args.batch_size
+
+            uv_batch = train_uv_shuffled[start_idx:end_idx]
+            values_batch = train_values_shuffled[start_idx:end_idx]
 
             optimizer.zero_grad()
 
@@ -385,7 +438,7 @@ if __name__ == "__main__":
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": avg_loss,
                 },
-                checkpoint_path
+                checkpoint_path,
             )
 
             model_pt_path = os.path.join(args.model, "model.pt")
@@ -398,16 +451,20 @@ if __name__ == "__main__":
                         "num_layers": args.layer_count,
                         "color_matrix": color_matrix,
                         "encoding_type": args.encoding,
-                        "hashgrid_config": {
-                            "n_levels": args.hashgrid_levels,
-                            "n_features": args.hashgrid_features,
-                            "log2_hashmap_size": log2_size,
-                            "base_resolution": args.hashgrid_base_res,
-                            "max_resolution": args.hashgrid_max_res,
-                        } if args.encoding == "hashgrid" else None,
-                    }
+                        "hashgrid_config": (
+                            {
+                                "n_levels": args.hashgrid_levels,
+                                "n_features": args.hashgrid_features,
+                                "log2_hashmap_size": log2_size,
+                                "base_resolution": args.hashgrid_base_res,
+                                "max_resolution": args.hashgrid_max_res,
+                            }
+                            if args.encoding == "hashgrid"
+                            else None
+                        ),
+                    },
                 },
-                model_pt_path
+                model_pt_path,
             )
 
         if args.single_step:
@@ -425,15 +482,19 @@ if __name__ == "__main__":
                 "num_layers": args.layer_count,
                 "color_matrix": color_matrix,
                 "encoding_type": args.encoding,
-                "hashgrid_config": {
-                    "n_levels": args.hashgrid_levels,
-                    "n_features": args.hashgrid_features,
-                    "log2_hashmap_size": log2_size,
-                    "base_resolution": args.hashgrid_base_res,
-                    "max_resolution": args.hashgrid_max_res,
-                } if args.encoding == "hashgrid" else None,
-            }
+                "hashgrid_config": (
+                    {
+                        "n_levels": args.hashgrid_levels,
+                        "n_features": args.hashgrid_features,
+                        "log2_hashmap_size": log2_size,
+                        "base_resolution": args.hashgrid_base_res,
+                        "max_resolution": args.hashgrid_max_res,
+                    }
+                    if args.encoding == "hashgrid"
+                    else None
+                ),
+            },
         },
-        final_model_path
+        final_model_path,
     )
     print(f"Training complete. Model saved to {final_model_path}")
