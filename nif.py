@@ -40,7 +40,7 @@ def make_image_grid(width, height, device):
     pixel_coords = torch.stack([v_coords.flatten(), u_coords.flatten()], dim=1)
 
     uv_coords = torch.stack(
-        [v_coords.flatten() / height, u_coords.flatten() / width], dim=1
+        [v_coords.flatten() / (height - 1), u_coords.flatten() / (width - 1)], dim=1
     )
 
     return pixel_coords, uv_coords
