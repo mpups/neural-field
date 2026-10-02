@@ -19,6 +19,16 @@ except ImportError:
     magic = None
 
 
+def detect_transfer_function(path, file_magic=None):
+    """Use logarithmic encoding for Radiance HDR and OpenEXR inputs."""
+    extension = os.path.splitext(os.fspath(path))[1].lower()
+    description = file_magic or ""
+    is_hdr = extension in {".hdr", ".exr"} or any(
+        marker in description for marker in ("OpenEXR", "Radiance HDR")
+    )
+    return "log" if is_hdr else "linear"
+
+
 def parse_args():
     parser = argparse.ArgumentParser("Neural Image Field (NIF) Generator - PyTorch")
     parser.add_argument(
@@ -191,19 +201,15 @@ if __name__ == "__main__":
         sample_count = args.train_samples
         print(f"Using {sample_count} stochastic samples (regenerated each epoch)")
 
-    # Detect HDR and choose transfer function
-    transfer_function = "linear"
+    # Detect HDR and choose transfer function. Extensions remain authoritative
+    # when python-magic is installed but reports a generic description.
+    file_magic = None
     if magic is not None:
         file_magic = magic.from_file(args.input)
         print(f"Input: {file_magic}")
-        if "OpenEXR" in file_magic:
-            print("HDR input detected: using log transfer function")
-            transfer_function = "log"
-    else:
-        _, file_extension = os.path.splitext(args.input)
-        if file_extension.lower() in [".exr"]:
-            print("HDR input detected (by extension): using log transfer function")
-            transfer_function = "log"
+    transfer_function = detect_transfer_function(args.input, file_magic)
+    if transfer_function == "log":
+        print("HDR input detected: using log transfer function")
 
     # Prepare image tensor on GPU once (stays for entire training)
     img_tensor, encode_params = nif.prepare_image_for_sampling(
