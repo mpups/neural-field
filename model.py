@@ -1,8 +1,13 @@
 """PyTorch Neural Image Field (NIF) Model Definition"""
 
+import os
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+
+from nvfp4 import fake_quantize_nvfp4
 
 
 class HashGridEncoding(nn.Module):
@@ -251,12 +256,16 @@ class NIFModel(nn.Module):
             layers.append(layer)
 
         self.layers = nn.ModuleList(layers)
+        self.nvfp4_qat = False
 
         # Color space conversion
         if color_matrix is not None:
             self.register_buffer("color_matrix", torch.from_numpy(color_matrix).float())
         else:
             self.color_matrix = None
+
+    def set_nvfp4_qat(self, enabled=True):
+        self.nvfp4_qat = enabled
 
     def forward(self, x):
         # Apply encoding if present
@@ -266,7 +275,12 @@ class NIFModel(nn.Module):
         input_for_skip = x
 
         for i, layer in enumerate(self.layers):
-            x = layer(x)
+            if self.nvfp4_qat:
+                quantized_input = fake_quantize_nvfp4(x, (1, 16))
+                quantized_weight = fake_quantize_nvfp4(layer.weight, (16, 16))
+                x = F.linear(quantized_input, quantized_weight, layer.bias)
+            else:
+                x = layer(x)
 
             if i == self.skip_index:
                 x = torch.relu(x)
@@ -278,6 +292,43 @@ class NIFModel(nn.Module):
             x = torch.nn.functional.linear(x, self.color_matrix)
 
         return x
+
+
+def model_from_config(config):
+    """Construct a model from checkpoint metadata."""
+    hash_config = config.get("hashgrid_config", {})
+    encoding = HashGridEncoding(
+        n_levels=hash_config.get("n_levels", 16),
+        n_features=hash_config.get("n_features", 2),
+        log2_hashmap_size=hash_config.get("log2_hashmap_size", 19),
+        level_log2_hashmap_sizes=hash_config.get("level_log2_hashmap_sizes"),
+        base_resolution=hash_config.get("base_resolution", 16),
+        max_resolution=hash_config.get("max_resolution", 2048),
+        layout=hash_config.get("layout", "hash"),
+    )
+    model = NIFModel(
+        input_dim=config.get("input_dim", 2),
+        layer_size=config["layer_size"],
+        num_layers=config["num_layers"],
+        color_matrix=config.get("color_matrix"),
+        encoding=encoding,
+    )
+    quantization = config.get("quantization", {})
+    model.set_nvfp4_qat(quantization.get("mlp") == "nvfp4")
+    return model
+
+
+def load_model_checkpoint(path, device="cpu", quantized=None):
+    """Load a model checkpoint from either a model directory or .pt file."""
+    checkpoint_path = os.path.join(path, "model.pt") if os.path.isdir(path) else path
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if "model_config" not in checkpoint:
+        raise ValueError(f"Checkpoint has no model_config: {checkpoint_path}")
+    model = model_from_config(checkpoint["model_config"])
+    model.load_state_dict(checkpoint["model_state_dict"])
+    if quantized is not None:
+        model.set_nvfp4_qat(quantized)
+    return model.to(device), checkpoint
 
 
 def compile_model(model, mode="reduce-overhead"):

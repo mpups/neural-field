@@ -12,6 +12,7 @@ import time
 import sys
 import os
 import device_utils as du
+from nvfp4 import export_nvfp4
 
 try:
     import magic
@@ -173,6 +174,46 @@ def parse_args():
         choices=["default", "reduce-overhead", "max-autotune"],
         help="torch.compile mode.",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Warm start from a model directory or model.pt checkpoint.",
+    )
+    parser.add_argument(
+        "--resume-optimizer",
+        action="store_true",
+        help="Restore Adam moments from --resume while keeping --learning-rate.",
+    )
+    parser.add_argument(
+        "--nvfp4-qat",
+        action="store_true",
+        help="Fine-tune MLP weights and activations with NVFP4 fake quantization.",
+    )
+    parser.add_argument(
+        "--nvfp4-start-epoch",
+        type=int,
+        default=0,
+        help="Absolute epoch at which NVFP4 fake quantization begins.",
+    )
+    parser.add_argument(
+        "--teacher-model",
+        type=str,
+        default="",
+        help="Full-precision model directory or model.pt used for distillation.",
+    )
+    parser.add_argument(
+        "--distillation-weight",
+        type=float,
+        default=0.0,
+        help="Weight applied to MSE against the full-precision teacher output.",
+    )
+    parser.add_argument(
+        "--evaluation-batch-size",
+        type=int,
+        default=2048,
+        help="Batch size used for final full-image PSNR evaluation.",
+    )
     args = parser.parse_args()
     return args
 
@@ -184,6 +225,14 @@ if __name__ == "__main__":
         raise ValueError(
             "Layer count >= 4 must be a multiple of 2 (for skip connections)."
         )
+    if args.nvfp4_start_epoch < 0:
+        raise ValueError("--nvfp4-start-epoch must be non-negative")
+    if args.distillation_weight < 0:
+        raise ValueError("--distillation-weight must be non-negative")
+    if args.distillation_weight and not args.teacher_model:
+        raise ValueError("--distillation-weight requires --teacher-model")
+    if args.resume_optimizer and not args.resume:
+        raise ValueError("--resume-optimizer requires --resume")
     level_log2_sizes = None
     if args.hashgrid_level_log2_sizes:
         level_log2_sizes = [int(value) for value in args.hashgrid_level_log2_sizes.split(",")]
@@ -191,6 +240,14 @@ if __name__ == "__main__":
             raise ValueError("--hashgrid-level-log2-sizes must contain one value per level")
 
     device = du.get_device(args.device)
+
+    resume_checkpoint = None
+    if args.resume:
+        model_obj, resume_checkpoint = nif_model.load_model_checkpoint(
+            args.resume, device, quantized=False
+        )
+        model_config = dict(resume_checkpoint["model_config"])
+        print(f"Warm starting from: {args.resume}")
 
     # Load image
     img = cv2.imread(args.input, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
@@ -241,38 +298,38 @@ if __name__ == "__main__":
     else:
         loss_fn = nn.HuberLoss(delta=0.001, reduction="mean")
 
-    # Hash grid encoding setup
-    log2_size = args.hashgrid_log2_size
-    input_dim = 2  # Raw UV
+    # Hash grid encoding setup. A resumed checkpoint owns its architecture.
+    if args.resume:
+        encoding_module = model_obj.encoding
+    else:
+        log2_size = args.hashgrid_log2_size
+        if log2_size == 0:
+            image_bytes = height * width * 3 * 4  # FP32 image
+            target_bytes = image_bytes / args.compression_ratio
+            mlp_bytes = 2 * args.layer_size * args.layer_size * 4
+            hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
+            total_entries = hash_bytes / (4 * args.hashgrid_features)
+            entries_per_level = total_entries / args.hashgrid_levels
+            log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
+            print(
+                f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
+                f"for {args.compression_ratio}:1 target compression"
+            )
 
-    # Auto-calculate hash table size if not specified
-    if log2_size == 0:
-        image_bytes = height * width * 3 * 4  # FP32 image
-        target_bytes = image_bytes / args.compression_ratio
-        mlp_bytes = 2 * args.layer_size * args.layer_size * 4
-        hash_bytes = max(target_bytes - mlp_bytes, 32768)  # Min 32KB
-        total_entries = hash_bytes / (4 * args.hashgrid_features)
-        entries_per_level = total_entries / args.hashgrid_levels
-        log2_size = max(10, min(18, int(np.ceil(np.log2(entries_per_level)))))
-        print(
-            f"Auto hash table size: log2={log2_size} ({2**log2_size} entries/level) "
-            f"for {args.compression_ratio}:1 target compression"
-        )
+        encoding_module = nif_model.HashGridEncoding(
+            n_levels=args.hashgrid_levels,
+            n_features=args.hashgrid_features,
+            log2_hashmap_size=log2_size,
+            level_log2_hashmap_sizes=level_log2_sizes,
+            base_resolution=args.hashgrid_base_res,
+            max_resolution=args.hashgrid_max_res,
+            layout=args.hashgrid_layout,
+        ).to(device)
 
-    encoding_module = nif_model.HashGridEncoding(
-        n_levels=args.hashgrid_levels,
-        n_features=args.hashgrid_features,
-        log2_hashmap_size=log2_size,
-        level_log2_hashmap_sizes=level_log2_sizes,
-        base_resolution=args.hashgrid_base_res,
-        max_resolution=args.hashgrid_max_res,
-        layout=args.hashgrid_layout,
-    ).to(device)
-
-    total_hash_params = encoding_module.embedding.num_embeddings * args.hashgrid_features
+    total_hash_params = encoding_module.embedding.num_embeddings * encoding_module.n_features
     print(
-        f"Hash grid encoding: {args.hashgrid_levels} levels, {args.hashgrid_layout} layout, "
-        f"{encoding_module.level_sizes} entries/level, {args.hashgrid_features} features/entry, "
+        f"Hash grid encoding: {encoding_module.n_levels} levels, {encoding_module.layout} layout, "
+        f"{encoding_module.level_sizes} entries/level, {encoding_module.n_features} features/entry, "
         f"{total_hash_params:,} hash params"
     )
 
@@ -288,46 +345,78 @@ if __name__ == "__main__":
 
     # Initial dataset
     train_uv_encoded, train_values = generate_training_data()
-    steps_per_epoch = sample_count // args.batch_size
+    steps_per_epoch = (sample_count + args.batch_size - 1) // args.batch_size
 
-    # Color space conversion
-    color_matrix = nif.color_space_to_bgr_matrix(args.color_space)
+    if not args.resume:
+        color_matrix = nif.color_space_to_bgr_matrix(args.color_space)
+        model_obj = nif_model.NIFModel(
+            input_dim=2,
+            layer_size=args.layer_size,
+            num_layers=args.layer_count,
+            color_matrix=color_matrix,
+            encoding=encoding_module,
+        ).to(device)
+        model_config = {
+            "input_dim": 2,
+            "layer_size": args.layer_size,
+            "num_layers": args.layer_count,
+            "color_matrix": color_matrix,
+            "hashgrid_config": {
+                "n_levels": args.hashgrid_levels,
+                "n_features": args.hashgrid_features,
+                "log2_hashmap_size": log2_size,
+                "level_log2_hashmap_sizes": list(encoding_module.level_log2_hashmap_sizes),
+                "base_resolution": args.hashgrid_base_res,
+                "max_resolution": args.hashgrid_max_res,
+                "layout": args.hashgrid_layout,
+            },
+        }
 
-    # Create model
-    model_obj = nif_model.NIFModel(
-        input_dim=input_dim,
-        layer_size=args.layer_size,
-        num_layers=args.layer_count,
-        color_matrix=color_matrix,
-        encoding=encoding_module,
-    )
-    model_obj = model_obj.to(device)
-
-    model_config = {
-        "input_dim": input_dim,
-        "layer_size": args.layer_size,
-        "num_layers": args.layer_count,
-        "color_matrix": color_matrix,
-        "hashgrid_config": {
-            "n_levels": args.hashgrid_levels,
-            "n_features": args.hashgrid_features,
-            "log2_hashmap_size": log2_size,
-            "level_log2_hashmap_sizes": list(encoding_module.level_log2_hashmap_sizes),
-            "base_resolution": args.hashgrid_base_res,
-            "max_resolution": args.hashgrid_max_res,
-            "layout": args.hashgrid_layout,
-        },
-    }
+    use_nvfp4 = args.nvfp4_qat or model_config.get("quantization", {}).get("mlp") == "nvfp4"
+    if use_nvfp4:
+        model_config["quantization"] = {
+            "mlp": "nvfp4",
+            "values": "e2m1",
+            "block_scale": "e4m3",
+            "global_scale": "fp32",
+            "weight_block_shape": [16, 16],
+            "activation_block_shape": [1, 16],
+        }
 
     print(f"\nModel created:")
     total_params = sum(p.numel() for p in model_obj.parameters())
     print(f"Total parameters: {total_params:,}")
+
+    teacher_model = None
+    if args.teacher_model:
+        teacher_model, _ = nif_model.load_model_checkpoint(
+            args.teacher_model, device, quantized=False
+        )
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+        print(f"Full-precision teacher loaded from: {args.teacher_model}")
+
+    first_epoch = resume_checkpoint.get("epoch", -1) + 1 if resume_checkpoint else 0
+    num_epochs = 1 if args.single_step else args.epochs
+    final_epoch = first_epoch + num_epochs
+    if use_nvfp4 and args.nvfp4_start_epoch >= final_epoch:
+        raise ValueError("--nvfp4-start-epoch must occur within this training run")
+    model_obj.set_nvfp4_qat(use_nvfp4 and first_epoch >= args.nvfp4_start_epoch)
+    base_model = model_obj
 
     # Compile model if requested
     if args.compile:
         model_obj = nif_model.compile_model(model_obj, mode=args.compile_mode)
 
     optimizer = optim.Adam(model_obj.parameters(), lr=args.learning_rate)
+    if args.resume_optimizer and "optimizer_state_dict" not in resume_checkpoint:
+        raise ValueError("The resume checkpoint has no optimizer state")
+    if args.resume_optimizer:
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = args.learning_rate
+        print(f"Optimizer state restored with learning rate {args.learning_rate:g}")
 
     # Mixed precision (CUDA only)
     use_fp16 = args.fp16 and device.type == "cuda"
@@ -346,17 +435,17 @@ if __name__ == "__main__":
         model_path=args.model,
     )
 
-    # Training loop
-    num_epochs = 1 if args.single_step else args.epochs
-
     print(
-        f"\nStarting training: {num_epochs} epochs, {steps_per_epoch} steps/epoch, device: {device}"
+        f"\nStarting training: epochs {first_epoch}..{final_epoch - 1}, "
+        f"{steps_per_epoch} steps/epoch, device: {device}"
     )
     if not args.deterministic_samples:
         print("Stochastic mode: regenerating samples each epoch")
 
     epoch_start_time = time.time()
-    for epoch in range(num_epochs):
+    for epoch in range(first_epoch, final_epoch):
+        qat_active = use_nvfp4 and epoch >= args.nvfp4_start_epoch
+        base_model.set_nvfp4_qat(qat_active)
         model_obj.train()
 
         # Regenerate samples each epoch for stochastic mode
@@ -369,39 +458,64 @@ if __name__ == "__main__":
         train_values_shuffled = train_values[perm]
 
         epoch_loss = 0.0
+        epoch_reconstruction_loss = 0.0
+        epoch_distillation_loss = 0.0
         num_batches = 0
 
         for batch_idx in range(steps_per_epoch):
             start_idx = batch_idx * args.batch_size
-            end_idx = start_idx + args.batch_size
+            end_idx = min(start_idx + args.batch_size, train_uv_shuffled.shape[0])
 
             uv_batch = train_uv_shuffled[start_idx:end_idx]
             values_batch = train_values_shuffled[start_idx:end_idx]
 
             optimizer.zero_grad()
 
+            teacher_outputs = None
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_outputs = teacher_model(uv_batch)
+
             if use_fp16:
                 with torch.autocast(device_type=device.type, dtype=torch.float16):
                     outputs = model_obj(uv_batch)
-                    loss = loss_fn(outputs, values_batch)
+                    reconstruction_loss = loss_fn(outputs, values_batch)
+                    distillation_loss = (
+                        nn.functional.mse_loss(outputs, teacher_outputs)
+                        if teacher_outputs is not None else outputs.new_zeros(())
+                    )
+                    loss = reconstruction_loss + args.distillation_weight * distillation_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 outputs = model_obj(uv_batch)
-                loss = loss_fn(outputs, values_batch)
+                reconstruction_loss = loss_fn(outputs, values_batch)
+                distillation_loss = (
+                    nn.functional.mse_loss(outputs, teacher_outputs)
+                    if teacher_outputs is not None else outputs.new_zeros(())
+                )
+                loss = reconstruction_loss + args.distillation_weight * distillation_loss
                 loss.backward()
                 optimizer.step()
 
             epoch_loss += loss.item()
+            epoch_reconstruction_loss += reconstruction_loss.item()
+            epoch_distillation_loss += distillation_loss.item()
             num_batches += 1
 
             if args.single_step:
                 break
 
         avg_loss = epoch_loss / max(num_batches, 1)
+        avg_reconstruction_loss = epoch_reconstruction_loss / max(num_batches, 1)
+        avg_distillation_loss = epoch_distillation_loss / max(num_batches, 1)
         epoch_time = time.time() - epoch_start_time
-        print(f"Epoch {epoch}: {epoch_time:.2f}s, loss={avg_loss:.6f}")
+        print(
+            f"Epoch {epoch}: {epoch_time:.2f}s, loss={avg_loss:.6f}, "
+            f"reconstruction={avg_reconstruction_loss:.6f}, "
+            f"distillation={avg_distillation_loss:.6f}, nvfp4={qat_active}"
+        )
         sys.stdout.flush()
         epoch_start_time = time.time()
 
@@ -415,7 +529,8 @@ if __name__ == "__main__":
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model_obj.state_dict(),
+                    "model_state_dict": base_model.state_dict(),
+                    "model_config": model_config,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "loss": avg_loss,
                 },
@@ -425,8 +540,10 @@ if __name__ == "__main__":
             model_pt_path = os.path.join(args.model, "model.pt")
             torch.save(
                 {
-                    "model_state_dict": model_obj.state_dict(),
+                    "epoch": epoch,
+                    "model_state_dict": base_model.state_dict(),
                     "model_config": model_config,
+                    "optimizer_state_dict": optimizer.state_dict(),
                 },
                 model_pt_path,
             )
@@ -439,20 +556,29 @@ if __name__ == "__main__":
     final_model_path = os.path.join(args.model, "model.pt")
     torch.save(
         {
-            "model_state_dict": model_obj.state_dict(),
+            "epoch": epoch,
+            "model_state_dict": base_model.state_dict(),
             "model_config": model_config,
+            "optimizer_state_dict": optimizer.state_dict(),
         },
         final_model_path,
     )
     print(f"Training complete. Model saved to {final_model_path}")
 
+    if use_nvfp4:
+        nvfp4_path = os.path.join(args.model, "nvfp4.pt")
+        export_nvfp4(base_model, nvfp4_path)
+        print(f"Packed logical NVFP4 MLP saved to {nvfp4_path}")
+
     # Final PSNR evaluation
     print("\nEvaluating final PSNR...")
+    base_model.set_nvfp4_qat(use_nvfp4)
     reconstructed = nif.run_inference(
-        model=model_obj,
+        model=base_model,
         device=device,
         img_shape=img.shape,
         encode_params=encode_params,
+        batch_size=args.evaluation_batch_size,
     )
     psnr = nif.compute_psnr(args.input, reconstructed)
     if psnr:

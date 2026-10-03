@@ -83,30 +83,7 @@ if __name__ == "__main__":
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    model_config = checkpoint.get("model_config", {})
-
-    # Create hash grid encoding module
-    hashgrid_config = model_config.get("hashgrid_config", {})
-    encoding_module = nif_model.HashGridEncoding(
-        n_levels=hashgrid_config.get("n_levels", 16),
-        n_features=hashgrid_config.get("n_features", 2),
-        log2_hashmap_size=hashgrid_config.get("log2_hashmap_size", 19),
-        level_log2_hashmap_sizes=hashgrid_config.get("level_log2_hashmap_sizes"),
-        base_resolution=hashgrid_config.get("base_resolution", 16),
-        max_resolution=hashgrid_config.get("max_resolution", 2048),
-        layout=hashgrid_config.get("layout", "hash"),
-    ).to(device)
-
-    model = nif_model.NIFModel(
-        input_dim=model_config.get("input_dim"),
-        layer_size=model_config.get("layer_size"),
-        num_layers=model_config.get("num_layers"),
-        color_matrix=model_config.get("color_matrix"),
-        encoding=encoding_module,
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
+    model, _ = nif_model.load_model_checkpoint(model_path, device)
     model.eval()
 
     print(f"Model loaded from: {model_path}")

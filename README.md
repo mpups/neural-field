@@ -32,3 +32,34 @@ sweeps. The list length must match `--hashgrid-levels`:
 python train_nif.py --input image.hdr --hashgrid-levels 4 \
   --hashgrid-level-log2-sizes 12,13,14,15
 ```
+
+## NVFP4 quantization-aware fine-tuning
+
+Fine-tune an existing full-precision checkpoint with the NVIDIA NVFP4 E2M1
+value format. The simulation uses FP8 E4M3 scales per 16 elements, an FP32
+global tensor scale, 16x16 scaling for MLP weights, 1x16 scaling for
+activations, and straight-through gradients to FP32 master weights:
+
+```bash
+python train_nif.py \
+  --input image.hdr \
+  --model ./saved_model_nvfp4 \
+  --resume ./saved_model \
+  --teacher-model ./saved_model \
+  --nvfp4-qat \
+  --distillation-weight 1.0 \
+  --learning-rate 1e-5 \
+  --epochs 20 \
+  --fp16
+```
+
+`--resume` restores model weights and architecture. Add `--resume-optimizer`
+only when continuing the same optimization run; Adam moments are then restored
+but the explicitly requested `--learning-rate` is retained. The QAT checkpoint
+contains FP32 master weights and quantization metadata. `predict_nif.py`
+automatically applies the fake-NVFP4 forward path for such checkpoints.
+
+Training also writes `nvfp4.pt`, which contains nibble-packed MLP weights and
+logical row-major scales. The scale layout is intentionally unswizzled: a
+future CUDA/CUTLASS backend must transform it to the hardware matrix layout.
+The current ray tracer cannot execute this packed artifact yet.
