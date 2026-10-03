@@ -257,6 +257,12 @@ class NIFModel(nn.Module):
 
         self.layers = nn.ModuleList(layers)
         self.nvfp4_qat = False
+        self.nvfp4_static_activation_scales = False
+        self.register_buffer(
+            "nvfp4_activation_global_scales",
+            torch.ones(len(layers), dtype=torch.float32),
+            persistent=False,
+        )
 
         # Color space conversion
         if color_matrix is not None:
@@ -264,7 +270,19 @@ class NIFModel(nn.Module):
         else:
             self.color_matrix = None
 
-    def set_nvfp4_qat(self, enabled=True):
+    def set_nvfp4_qat(self, enabled=True, activation_global_scales=None):
+        if activation_global_scales is not None:
+            scales = torch.as_tensor(
+                activation_global_scales,
+                dtype=torch.float32,
+                device=self.nvfp4_activation_global_scales.device,
+            )
+            if scales.shape != self.nvfp4_activation_global_scales.shape:
+                raise ValueError("one NVFP4 activation global scale is required per MLP layer")
+            if not torch.isfinite(scales).all() or not torch.all(scales > 0):
+                raise ValueError("NVFP4 activation global scales must be finite and positive")
+            self.nvfp4_activation_global_scales.copy_(scales)
+            self.nvfp4_static_activation_scales = True
         self.nvfp4_qat = enabled
 
     def forward(self, x):
@@ -276,7 +294,11 @@ class NIFModel(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if self.nvfp4_qat:
-                quantized_input = fake_quantize_nvfp4(x, (1, 16))
+                activation_scale = (
+                    self.nvfp4_activation_global_scales[i]
+                    if self.nvfp4_static_activation_scales else None
+                )
+                quantized_input = fake_quantize_nvfp4(x, (1, 16), activation_scale)
                 quantized_weight = fake_quantize_nvfp4(layer.weight, (16, 16))
                 x = F.linear(quantized_input, quantized_weight, layer.bias)
             else:
@@ -314,8 +336,40 @@ def model_from_config(config):
         encoding=encoding,
     )
     quantization = config.get("quantization", {})
-    model.set_nvfp4_qat(quantization.get("mlp") == "nvfp4")
+    model.set_nvfp4_qat(
+        quantization.get("mlp") == "nvfp4",
+        quantization.get("activation_global_scales"),
+    )
     return model
+
+
+def calibrate_nvfp4_activation_scales(model, inputs, batch_size=65536):
+    """Measure fixed activation tensor scales for direct producer-side packing."""
+    maxima = torch.zeros(len(model.layers), device=inputs.device, dtype=torch.float32)
+    hooks = []
+    for index, layer in enumerate(model.layers):
+        def capture(_layer, arguments, layer_index=index):
+            maxima[layer_index] = torch.maximum(
+                maxima[layer_index], arguments[0].detach().float().abs().amax()
+            )
+        hooks.append(layer.register_forward_pre_hook(capture))
+
+    was_training = model.training
+    was_quantized = model.nvfp4_qat
+    model.set_nvfp4_qat(False)
+    model.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, inputs.shape[0], batch_size):
+                model(inputs[start:start + batch_size])
+    finally:
+        for hook in hooks:
+            hook.remove()
+        model.train(was_training)
+        model.set_nvfp4_qat(was_quantized)
+
+    denominator = 448.0 * 6.0
+    return torch.where(maxima > 0, maxima / denominator, torch.ones_like(maxima))
 
 
 def load_model_checkpoint(path, device="cpu", quantized=None):

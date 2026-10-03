@@ -33,7 +33,11 @@ def _round_e4m3(values: torch.Tensor) -> torch.Tensor:
     return values.to(torch.float8_e4m3fn).to(torch.float32)
 
 
-def quantize_nvfp4(tensor: torch.Tensor, block_shape: tuple[int, int]) -> NVFP4Tensor:
+def quantize_nvfp4(
+    tensor: torch.Tensor,
+    block_shape: tuple[int, int],
+    global_scale: torch.Tensor | float | None = None,
+) -> NVFP4Tensor:
     """Quantize a matrix using logical NVFP4 two-level block scaling."""
     if tensor.dim() != 2:
         raise ValueError("NVFP4 quantization expects a matrix")
@@ -53,12 +57,19 @@ def quantize_nvfp4(tensor: torch.Tensor, block_shape: tuple[int, int]) -> NVFP4T
         padded_columns // block_columns, block_columns,
     ).permute(0, 2, 1, 3)
 
-    global_amax = values.abs().amax()
-    global_scale = torch.where(
-        global_amax > 0,
-        global_amax / (E4M3_MAX * E2M1_MAX),
-        torch.ones_like(global_amax),
-    )
+    if global_scale is None:
+        global_amax = values.abs().amax()
+        global_scale = torch.where(
+            global_amax > 0,
+            global_amax / (E4M3_MAX * E2M1_MAX),
+            torch.ones_like(global_amax),
+        )
+    else:
+        global_scale = torch.as_tensor(
+            global_scale, dtype=torch.float32, device=tensor.device
+        ).detach()
+        if global_scale.numel() != 1:
+            raise ValueError("NVFP4 global scale must contain one value")
     block_amax = tiles.abs().amax(dim=(-2, -1))
     block_scales = _round_e4m3((block_amax / E2M1_MAX) / global_scale)
     effective_scales = block_scales * global_scale
@@ -94,10 +105,16 @@ def quantize_nvfp4(tensor: torch.Tensor, block_shape: tuple[int, int]) -> NVFP4T
     )
 
 
-def fake_quantize_nvfp4(tensor: torch.Tensor, block_shape: tuple[int, int]) -> torch.Tensor:
+def fake_quantize_nvfp4(
+    tensor: torch.Tensor,
+    block_shape: tuple[int, int],
+    global_scale: torch.Tensor | float | None = None,
+) -> torch.Tensor:
     """Apply NVFP4 in the forward pass and STE identity in the backward pass."""
     matrix = tensor.reshape(-1, tensor.shape[-1])
-    quantized = quantize_nvfp4(matrix, block_shape).dequantized.reshape_as(tensor)
+    quantized = quantize_nvfp4(
+        matrix, block_shape, global_scale
+    ).dequantized.reshape_as(tensor)
     return tensor + (quantized - tensor).detach()
 
 
@@ -129,6 +146,9 @@ def export_nvfp4(model, output: str | Path) -> None:
             "version": 1,
             "weight_scaling": "2d-16x16-e4m3-with-fp32-global",
             "activation_scaling": "1d-1x16-e4m3-with-fp32-global",
+            "activation_global_scales_fp32": (
+                model.nvfp4_activation_global_scales.detach().cpu()
+            ),
             "scale_layout": "logical-row-major-unswizzled",
             "layers": layers,
         },

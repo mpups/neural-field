@@ -197,6 +197,12 @@ def parse_args():
         help="Absolute epoch at which NVFP4 fake quantization begins.",
     )
     parser.add_argument(
+        "--nvfp4-calibration-samples",
+        type=int,
+        default=262144,
+        help="Samples used to fix deployment activation scales before NVFP4 QAT.",
+    )
+    parser.add_argument(
         "--teacher-model",
         type=str,
         default="",
@@ -227,6 +233,8 @@ if __name__ == "__main__":
         )
     if args.nvfp4_start_epoch < 0:
         raise ValueError("--nvfp4-start-epoch must be non-negative")
+    if args.nvfp4_calibration_samples < 1:
+        raise ValueError("--nvfp4-calibration-samples must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
     if args.distillation_weight and not args.teacher_model:
@@ -372,8 +380,24 @@ if __name__ == "__main__":
             },
         }
 
-    use_nvfp4 = args.nvfp4_qat or model_config.get("quantization", {}).get("mlp") == "nvfp4"
+    existing_quantization = model_config.get("quantization", {})
+    use_nvfp4 = args.nvfp4_qat or existing_quantization.get("mlp") == "nvfp4"
     if use_nvfp4:
+        activation_scales = existing_quantization.get("activation_global_scales")
+        if activation_scales is None:
+            calibration_count = min(
+                args.nvfp4_calibration_samples, train_uv_encoded.shape[0]
+            )
+            activation_scales = nif_model.calibrate_nvfp4_activation_scales(
+                model_obj,
+                train_uv_encoded[:calibration_count],
+                min(args.batch_size, calibration_count),
+            ).tolist()
+            print(
+                "Calibrated fixed NVFP4 activation global scales: "
+                f"{activation_scales}"
+            )
+        model_obj.set_nvfp4_qat(False, activation_scales)
         model_config["quantization"] = {
             "mlp": "nvfp4",
             "values": "e2m1",
@@ -381,6 +405,7 @@ if __name__ == "__main__":
             "global_scale": "fp32",
             "weight_block_shape": [16, 16],
             "activation_block_shape": [1, 16],
+            "activation_global_scales": activation_scales,
         }
 
     print(f"\nModel created:")

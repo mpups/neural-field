@@ -38,7 +38,10 @@ python train_nif.py --input image.hdr --hashgrid-levels 4 \
 Fine-tune an existing full-precision checkpoint with the NVIDIA NVFP4 E2M1
 value format. The simulation uses FP8 E4M3 scales per 16 elements, an FP32
 global tensor scale, 16x16 scaling for MLP weights, 1x16 scaling for
-activations, and straight-through gradients to FP32 master weights:
+activations, and straight-through gradients to FP32 master weights. Activation
+global scales are calibrated once and fixed during QAT, allowing the producer
+of each activation to write packed NVFP4 and block scales directly without a
+runtime tensor-wide reduction:
 
 ```bash
 python train_nif.py \
