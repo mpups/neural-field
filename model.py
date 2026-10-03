@@ -19,17 +19,30 @@ class HashGridEncoding(nn.Module):
         n_levels=16,
         n_features=2,
         log2_hashmap_size=19,
+        level_log2_hashmap_sizes=None,
         base_resolution=16,
         max_resolution=2048,
+        layout="hash",
     ):
         super().__init__()
+
+        if layout not in {"hash", "hybrid"}:
+            raise ValueError(f"Unknown hash-grid layout: {layout}")
+        if level_log2_hashmap_sizes is None:
+            level_log2_hashmap_sizes = [log2_hashmap_size] * n_levels
+        if len(level_log2_hashmap_sizes) != n_levels:
+            raise ValueError("level_log2_hashmap_sizes must contain one value per level")
+        if any(size < 1 or size > 30 for size in level_log2_hashmap_sizes):
+            raise ValueError("hash-grid log2 sizes must be between 1 and 30")
 
         self.n_levels = n_levels
         self.n_features = n_features
         self.log2_hashmap_size = log2_hashmap_size
-        self.hashmap_size = 2**log2_hashmap_size
+        self.hashmap_size = 1 << log2_hashmap_size
+        self.level_log2_hashmap_sizes = tuple(level_log2_hashmap_sizes)
         self.base_resolution = base_resolution
         self.max_resolution = max_resolution
+        self.layout = layout
 
         # Compute resolution growth factor
         if n_levels > 1:
@@ -46,15 +59,39 @@ class HashGridEncoding(nn.Module):
         )
         self.register_buffer("resolutions", resolutions)
 
-        # Single unified embedding table for all levels
-        # Shape: (L * T, F) - kept as FP32, autocast handles FP16 compute
-        total_entries = n_levels * self.hashmap_size
+        hash_table_sizes = [1 << size for size in self.level_log2_hashmap_sizes]
+        dense_strides = [int(resolution) + 2 for resolution in resolutions]
+        level_sizes = []
+        level_is_dense = []
+        for hash_size, dense_stride in zip(hash_table_sizes, dense_strides):
+            dense_size = dense_stride * dense_stride
+            use_dense = layout == "hybrid" and dense_size <= hash_size
+            level_sizes.append(dense_size if use_dense else hash_size)
+            level_is_dense.append(use_dense)
+        level_offsets = np.cumsum([0] + level_sizes[:-1]).tolist()
+
+        # Single packed embedding containing variable-sized per-level tables.
+        # It remains FP32 during optimization; autocast controls compute precision.
+        total_entries = sum(level_sizes)
         self.embedding = nn.Embedding(total_entries, n_features)
         nn.init.uniform_(self.embedding.weight, -1e-4, 1e-4)
 
-        # Level offsets for indexing into unified table
-        level_offsets = torch.arange(n_levels, dtype=torch.int64) * self.hashmap_size
-        self.register_buffer("level_offsets", level_offsets)
+        self.register_buffer("level_offsets", torch.tensor(level_offsets, dtype=torch.int64))
+        self.register_buffer(
+            "hash_masks",
+            torch.tensor([size - 1 for size in hash_table_sizes], dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "dense_strides",
+            torch.tensor(
+                [stride if use_dense else 0
+                 for stride, use_dense in zip(dense_strides, level_is_dense)],
+                dtype=torch.int64,
+            ),
+            persistent=False,
+        )
+        self.level_sizes = tuple(level_sizes)
 
         # Corner offsets for vectorized corner computation: (4, 2)
         corner_offsets = torch.tensor(
@@ -97,11 +134,16 @@ class HashGridEncoding(nn.Module):
         hashed = (corners[..., 0].long() * self.primes[0]) ^ (
             corners[..., 1].long() * self.primes[1]
         )
-        hashed = hashed % self.hashmap_size
+        hashed = hashed & self.hash_masks.view(1, L, 1)
+        dense = (
+            corners[..., 0].long() * self.dense_strides.view(1, L, 1)
+            + corners[..., 1].long()
+        )
+        indices = torch.where(self.dense_strides.view(1, L, 1) > 0, dense, hashed)
 
         # Add level offsets to get global indices: (N, L, 4)
         # level_offsets: (L,) -> (1, L, 1)
-        global_indices = hashed + self.level_offsets.view(1, L, 1)
+        global_indices = indices + self.level_offsets.view(1, L, 1)
 
         # Lookup features for all corners: (N, L, 4) -> (N*L*4, F) -> (N, L, 4, F)
         flat_indices = global_indices.reshape(-1)

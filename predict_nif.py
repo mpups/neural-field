@@ -92,8 +92,10 @@ if __name__ == "__main__":
         n_levels=hashgrid_config.get("n_levels", 16),
         n_features=hashgrid_config.get("n_features", 2),
         log2_hashmap_size=hashgrid_config.get("log2_hashmap_size", 19),
+        level_log2_hashmap_sizes=hashgrid_config.get("level_log2_hashmap_sizes"),
         base_resolution=hashgrid_config.get("base_resolution", 16),
         max_resolution=hashgrid_config.get("max_resolution", 2048),
+        layout=hashgrid_config.get("layout", "hash"),
     ).to(device)
 
     model = nif_model.NIFModel(

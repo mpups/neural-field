@@ -17,3 +17,18 @@ python train_nif.py --input Mandrill_portrait_2_Berlin_Zoo.jpg --epochs 20
 # Inference
 python predict_nif.py --output reconstruction.png --original Mandrill_portrait_2_Berlin_Zoo.jpg
 ```
+
+Use an Instant-NGP-style hybrid layout to store coarse levels densely and fine
+levels in hash tables:
+
+```bash
+python train_nif.py --input image.hdr --hashgrid-layout hybrid
+```
+
+Hash budgets can also be assigned independently to each level for architecture
+sweeps. The list length must match `--hashgrid-levels`:
+
+```bash
+python train_nif.py --input image.hdr --hashgrid-levels 4 \
+  --hashgrid-level-log2-sizes 12,13,14,15
+```

@@ -92,6 +92,18 @@ def parse_args():
         "14=16K, 15=32K, 16=64K entries.",
     )
     parser.add_argument(
+        "--hashgrid-level-log2-sizes",
+        type=str,
+        default="",
+        help="comma-separated per-level log2 table sizes; overrides --hashgrid-log2-size",
+    )
+    parser.add_argument(
+        "--hashgrid-layout",
+        choices=["hash", "hybrid"],
+        default="hash",
+        help="use direct dense storage for coarse levels that fit their table budget",
+    )
+    parser.add_argument(
         "--compression-ratio",
         type=float,
         default=8.0,
@@ -172,6 +184,11 @@ if __name__ == "__main__":
         raise ValueError(
             "Layer count >= 4 must be a multiple of 2 (for skip connections)."
         )
+    level_log2_sizes = None
+    if args.hashgrid_level_log2_sizes:
+        level_log2_sizes = [int(value) for value in args.hashgrid_level_log2_sizes.split(",")]
+        if len(level_log2_sizes) != args.hashgrid_levels:
+            raise ValueError("--hashgrid-level-log2-sizes must contain one value per level")
 
     device = du.get_device(args.device)
 
@@ -246,14 +263,16 @@ if __name__ == "__main__":
         n_levels=args.hashgrid_levels,
         n_features=args.hashgrid_features,
         log2_hashmap_size=log2_size,
+        level_log2_hashmap_sizes=level_log2_sizes,
         base_resolution=args.hashgrid_base_res,
         max_resolution=args.hashgrid_max_res,
+        layout=args.hashgrid_layout,
     ).to(device)
 
-    total_hash_params = args.hashgrid_levels * (2**log2_size) * args.hashgrid_features
+    total_hash_params = encoding_module.embedding.num_embeddings * args.hashgrid_features
     print(
-        f"Hash grid encoding: {args.hashgrid_levels} levels, "
-        f"{2**log2_size} entries/level, {args.hashgrid_features} features/entry, "
+        f"Hash grid encoding: {args.hashgrid_levels} levels, {args.hashgrid_layout} layout, "
+        f"{encoding_module.level_sizes} entries/level, {args.hashgrid_features} features/entry, "
         f"{total_hash_params:,} hash params"
     )
 
@@ -283,6 +302,22 @@ if __name__ == "__main__":
         encoding=encoding_module,
     )
     model_obj = model_obj.to(device)
+
+    model_config = {
+        "input_dim": input_dim,
+        "layer_size": args.layer_size,
+        "num_layers": args.layer_count,
+        "color_matrix": color_matrix,
+        "hashgrid_config": {
+            "n_levels": args.hashgrid_levels,
+            "n_features": args.hashgrid_features,
+            "log2_hashmap_size": log2_size,
+            "level_log2_hashmap_sizes": list(encoding_module.level_log2_hashmap_sizes),
+            "base_resolution": args.hashgrid_base_res,
+            "max_resolution": args.hashgrid_max_res,
+            "layout": args.hashgrid_layout,
+        },
+    }
 
     print(f"\nModel created:")
     total_params = sum(p.numel() for p in model_obj.parameters())
@@ -391,19 +426,7 @@ if __name__ == "__main__":
             torch.save(
                 {
                     "model_state_dict": model_obj.state_dict(),
-                    "model_config": {
-                        "input_dim": input_dim,
-                        "layer_size": args.layer_size,
-                        "num_layers": args.layer_count,
-                        "color_matrix": color_matrix,
-                        "hashgrid_config": {
-                            "n_levels": args.hashgrid_levels,
-                            "n_features": args.hashgrid_features,
-                            "log2_hashmap_size": log2_size,
-                            "base_resolution": args.hashgrid_base_res,
-                            "max_resolution": args.hashgrid_max_res,
-                        },
-                    },
+                    "model_config": model_config,
                 },
                 model_pt_path,
             )
@@ -417,19 +440,7 @@ if __name__ == "__main__":
     torch.save(
         {
             "model_state_dict": model_obj.state_dict(),
-            "model_config": {
-                "input_dim": input_dim,
-                "layer_size": args.layer_size,
-                "num_layers": args.layer_count,
-                "color_matrix": color_matrix,
-                "hashgrid_config": {
-                    "n_levels": args.hashgrid_levels,
-                    "n_features": args.hashgrid_features,
-                    "log2_hashmap_size": log2_size,
-                    "base_resolution": args.hashgrid_base_res,
-                    "max_resolution": args.hashgrid_max_res,
-                },
-            },
+            "model_config": model_config,
         },
         final_model_path,
     )
