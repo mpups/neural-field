@@ -462,7 +462,7 @@ if __name__ == "__main__":
             "highlight_linear_loss_weight": args.highlight_linear_loss_weight,
             "highlight_percentile": args.highlight_percentile,
             "hdr_transfer": transfer_function,
-            "color_matrix": color_matrix,
+            "color_matrix": None if color_matrix is None else color_matrix.tolist(),
             "hashgrid_config": {
                 "n_levels": args.hashgrid_levels,
                 "n_features": args.hashgrid_features,

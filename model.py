@@ -297,7 +297,7 @@ class NIFModel(nn.Module):
 
         # Color space conversion
         if color_matrix is not None:
-            self.register_buffer("color_matrix", torch.from_numpy(color_matrix).float())
+            self.register_buffer("color_matrix", torch.as_tensor(color_matrix).float())
         else:
             self.color_matrix = None
 
