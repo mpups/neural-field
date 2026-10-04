@@ -71,6 +71,30 @@ def test_fp8_checkpoint_restores_quantized_forward(tmp_path):
     assert restored(torch.rand(3, 2)).shape == (3, 3)
 
 
+def test_fp8_colour_conversion_uses_fixed_fp16_matrix():
+    colour_matrix = torch.tensor(
+        [[1.0, 2.032, 0.0], [1.0, -0.395, -0.581], [1.0, 0.0, 1.140]]
+    ).numpy()
+    network = NIFModel(
+        input_dim=2,
+        layer_size=16,
+        num_layers=2,
+        color_matrix=colour_matrix,
+        encoding=HashGridEncoding(n_levels=2, n_features=2, log2_hashmap_size=4),
+    )
+    inputs = torch.rand(3, 2)
+    network.set_fp8_qat(True)
+    without_matrix = network.color_matrix
+    network.color_matrix = None
+    encoded = network(inputs)
+    network.color_matrix = without_matrix
+
+    expected = torch.nn.functional.linear(
+        encoded, torch.from_numpy(colour_matrix).half().float()
+    ).half().float()
+    torch.testing.assert_close(network(inputs), expected, rtol=0, atol=0)
+
+
 def test_nvfp4_uses_e2m1_values_and_two_level_scaling():
     values = torch.tensor([[0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]])
     quantized = quantize_nvfp4(values, (1, 16))

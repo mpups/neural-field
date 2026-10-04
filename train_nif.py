@@ -154,11 +154,29 @@ def parse_args():
         "--mse", action="store_true", help="Use MSE loss instead of Huber loss."
     )
     parser.add_argument(
+        "--highlight-linear-loss-weight",
+        type=float,
+        default=0.0,
+        help="Weight for linear-radiance MSE on bright samples (0 disables).",
+    )
+    parser.add_argument(
+        "--highlight-percentile",
+        type=float,
+        default=95.0,
+        help="Reference luminance percentile defining bright samples.",
+    )
+    parser.add_argument(
         "--color-space",
         type=str,
         default="rgb",
         choices=["rgb", "yuv", "ycocg"],
         help="Color space for network output.",
+    )
+    parser.add_argument(
+        "--hdr-transfer",
+        choices=["auto", "log", "log1p"],
+        default="auto",
+        help="HDR transfer function; auto retains log for HDR and linear for LDR.",
     )
     parser.add_argument(
         "--device",
@@ -273,6 +291,10 @@ if __name__ == "__main__":
         raise ValueError("--nvfp4-calibration-samples must be positive")
     if args.distillation_weight < 0:
         raise ValueError("--distillation-weight must be non-negative")
+    if args.highlight_linear_loss_weight < 0:
+        raise ValueError("--highlight-linear-loss-weight must be non-negative")
+    if not 0 < args.highlight_percentile < 100:
+        raise ValueError("--highlight-percentile must be between 0 and 100")
     if args.distillation_weight and not args.teacher_model:
         raise ValueError("--distillation-weight requires --teacher-model")
     if args.resume_optimizer and not args.resume:
@@ -326,8 +348,12 @@ if __name__ == "__main__":
         file_magic = magic.from_file(args.input)
         print(f"Input: {file_magic}")
     transfer_function = detect_transfer_function(args.input, file_magic)
+    if transfer_function == "log" and args.hdr_transfer != "auto":
+        transfer_function = args.hdr_transfer
     if transfer_function == "log":
         print("HDR input detected: using log transfer function")
+    elif transfer_function == "log1p":
+        print("HDR input detected: using log1p transfer function")
 
     # Prepare image tensor on GPU once (stays for entire training)
     img_tensor, encode_params = nif.prepare_image_for_sampling(
@@ -335,6 +361,21 @@ if __name__ == "__main__":
     )
     print(f"Image tensor on GPU: {img_tensor.shape}, {img_tensor.device}")
     print(f"Encode params: {encode_params}")
+
+    luminance = 0.0722 * img[..., 0] + 0.7152 * img[..., 1] + 0.2126 * img[..., 2]
+    highlight_threshold = float(np.percentile(luminance, args.highlight_percentile))
+    radiance_scale = max(float(input_max), 1e-8)
+
+    def compute_highlight_loss(outputs, targets):
+        if args.highlight_linear_loss_weight == 0:
+            return outputs.new_zeros(())
+        return nif.highlight_linear_mse(
+            outputs,
+            targets,
+            encode_params,
+            highlight_threshold,
+            radiance_scale,
+        )
 
     # Loss function
     if args.mse:
@@ -416,6 +457,11 @@ if __name__ == "__main__":
             "hidden_layer_count": (
                 args.hidden_layer_count if paper_architecture else None
             ),
+            "color_space": args.color_space,
+            "training_loss": "mse" if args.mse else "huber",
+            "highlight_linear_loss_weight": args.highlight_linear_loss_weight,
+            "highlight_percentile": args.highlight_percentile,
+            "hdr_transfer": transfer_function,
             "color_matrix": color_matrix,
             "hashgrid_config": {
                 "n_levels": args.hashgrid_levels,
@@ -552,6 +598,7 @@ if __name__ == "__main__":
         epoch_loss = 0.0
         epoch_reconstruction_loss = 0.0
         epoch_distillation_loss = 0.0
+        epoch_highlight_loss = 0.0
         num_batches = 0
 
         for batch_idx in range(steps_per_epoch):
@@ -572,28 +619,39 @@ if __name__ == "__main__":
                 with torch.autocast(device_type=device.type, dtype=torch.float16):
                     outputs = model_obj(uv_batch)
                     reconstruction_loss = loss_fn(outputs, values_batch)
+                    highlight_loss = compute_highlight_loss(outputs, values_batch)
                     distillation_loss = (
                         nn.functional.mse_loss(outputs, teacher_outputs)
                         if teacher_outputs is not None else outputs.new_zeros(())
                     )
-                    loss = reconstruction_loss + args.distillation_weight * distillation_loss
+                    loss = (
+                        reconstruction_loss
+                        + args.highlight_linear_loss_weight * highlight_loss
+                        + args.distillation_weight * distillation_loss
+                    )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 outputs = model_obj(uv_batch)
                 reconstruction_loss = loss_fn(outputs, values_batch)
+                highlight_loss = compute_highlight_loss(outputs, values_batch)
                 distillation_loss = (
                     nn.functional.mse_loss(outputs, teacher_outputs)
                     if teacher_outputs is not None else outputs.new_zeros(())
                 )
-                loss = reconstruction_loss + args.distillation_weight * distillation_loss
+                loss = (
+                    reconstruction_loss
+                    + args.highlight_linear_loss_weight * highlight_loss
+                    + args.distillation_weight * distillation_loss
+                )
                 loss.backward()
                 optimizer.step()
 
             epoch_loss += loss.item()
             epoch_reconstruction_loss += reconstruction_loss.item()
             epoch_distillation_loss += distillation_loss.item()
+            epoch_highlight_loss += highlight_loss.item()
             num_batches += 1
 
             if args.single_step:
@@ -602,10 +660,12 @@ if __name__ == "__main__":
         avg_loss = epoch_loss / max(num_batches, 1)
         avg_reconstruction_loss = epoch_reconstruction_loss / max(num_batches, 1)
         avg_distillation_loss = epoch_distillation_loss / max(num_batches, 1)
+        avg_highlight_loss = epoch_highlight_loss / max(num_batches, 1)
         epoch_time = time.time() - epoch_start_time
         print(
             f"Epoch {epoch}: {epoch_time:.2f}s, loss={avg_loss:.6f}, "
             f"reconstruction={avg_reconstruction_loss:.6f}, "
+            f"highlight={avg_highlight_loss:.6f}, "
             f"distillation={avg_distillation_loss:.6f}, "
             f"nvfp4={nvfp4_active}, fp8={fp8_active}"
         )
@@ -692,15 +752,22 @@ if __name__ == "__main__":
             "layer_size": model_config["layer_size"],
             "hidden_layer_count": model_config.get("hidden_layer_count"),
             "architecture": model_config.get("architecture", "legacy-v1"),
+            "color_space": model_config.get("color_space", "rgb"),
+            "training_loss": model_config.get("training_loss", "huber"),
+            "highlight_linear_loss_weight": model_config.get(
+                "highlight_linear_loss_weight", 0.0
+            ),
+            "highlight_percentile": model_config.get("highlight_percentile", 95.0),
+            "hdr_transfer": encode_params["transfer_function"],
             "parameter_count": sum(parameter.numel() for parameter in base_model.parameters()),
             "mlp_macs_per_query": sum(
                 layer.in_features * layer.out_features for layer in base_model.layers
-            ),
+            ) + (0 if base_model.color_matrix is None else 9),
             "mlp_deployment_bytes": sum(
                 layer.weight.numel()
                 + (0 if layer.bias is None else 2 * layer.bias.numel())
                 for layer in base_model.layers
-            ),
+            ) + (0 if base_model.color_matrix is None else 18),
             "hash_deployment_bytes": base_model.encoding.embedding.weight.numel() * 2,
         }
     )

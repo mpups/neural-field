@@ -96,6 +96,22 @@ python sweep_nif.py \
   --fp8-qat
 ```
 
+The current HDR quality baseline uses H128/L4, YCoCg output, log-domain MSE,
+and a low-weight linear-radiance loss on the brightest 5% of samples:
+
+```bash
+python sweep_nif.py \
+  --input image.hdr \
+  --output-root ./sweeps/hdr-baseline \
+  --architectures 128x4 \
+  --seeds 1,2,3 \
+  --color-space ycocg \
+  --loss mse \
+  --highlight-linear-loss-weight 0.05 \
+  --highlight-percentile 95 \
+  --fp8-qat
+```
+
 The summary contains radiometric PSNR, log-domain PSNR, solid-angle-weighted
 luminance and energy errors, highlight chromaticity error, an exposure-stack
 display metric, deployment bytes, and MLP MACs per query. Full-precision

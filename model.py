@@ -351,7 +351,15 @@ class NIFModel(nn.Module):
                 x = torch.relu(x)
 
         if self.color_matrix is not None:
-            x = torch.nn.functional.linear(x, self.color_matrix)
+            if self.fp8_qat:
+                # The paper's fixed colour conversion remains outside the
+                # quantized MLP but executes with renderer-compatible FP16 I/O.
+                x = F.linear(
+                    x,
+                    self.color_matrix.to(torch.float16).to(x.dtype),
+                ).to(torch.float16).to(x.dtype)
+            else:
+                x = F.linear(x, self.color_matrix)
 
         return x
 

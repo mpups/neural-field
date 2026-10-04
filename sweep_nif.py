@@ -33,6 +33,10 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=262144)
     parser.add_argument("--evaluation-batch-size", type=int, default=65536)
     parser.add_argument("--color-space", choices=["rgb", "yuv", "ycocg"], default="rgb")
+    parser.add_argument("--loss", choices=["huber", "mse"], default="huber")
+    parser.add_argument("--hdr-transfer", choices=["log", "log1p"], default="log")
+    parser.add_argument("--highlight-linear-loss-weight", type=float, default=0.0)
+    parser.add_argument("--highlight-percentile", type=float, default=95.0)
     parser.add_argument("--hashgrid-levels", type=int, default=12)
     parser.add_argument("--hashgrid-features", type=int, default=2)
     parser.add_argument("--hashgrid-log2-size", type=int, default=16)
@@ -64,12 +68,22 @@ def main():
         "--batch-size", str(args.batch_size),
         "--evaluation-batch-size", str(args.evaluation_batch_size),
         "--color-space", args.color_space,
+        "--hdr-transfer", args.hdr_transfer,
         "--hashgrid-levels", str(args.hashgrid_levels),
         "--hashgrid-features", str(args.hashgrid_features),
         "--hashgrid-log2-size", str(args.hashgrid_log2_size),
         "--hashgrid-max-res", str(args.hashgrid_max_res),
         "--fp16",
     ]
+    if args.loss == "mse":
+        common.append("--mse")
+    if args.highlight_linear_loss_weight:
+        common.extend(
+            [
+                "--highlight-linear-loss-weight", str(args.highlight_linear_loss_weight),
+                "--highlight-percentile", str(args.highlight_percentile),
+            ]
+        )
 
     metric_paths = []
     for width, depth in architectures:
@@ -110,8 +124,19 @@ def main():
                     "--train-samples", str(args.train_samples),
                     "--batch-size", str(args.batch_size),
                     "--evaluation-batch-size", str(args.evaluation_batch_size),
+                    "--hdr-transfer", args.hdr_transfer,
                     "--seed", str(seed), "--fp16",
                 ]
+                if args.loss == "mse":
+                    qat_command.append("--mse")
+                if args.highlight_linear_loss_weight:
+                    qat_command.extend(
+                        [
+                            "--highlight-linear-loss-weight",
+                            str(args.highlight_linear_loss_weight),
+                            "--highlight-percentile", str(args.highlight_percentile),
+                        ]
+                    )
                 run(qat_command, qat / "train.log", args.dry_run)
                 qat_metrics = qat / "quality_metrics_fp8.json"
                 run(
@@ -138,7 +163,10 @@ def main():
     with (root / "summary.json").open("w") as file:
         json.dump(rows, file, indent=2, sort_keys=True)
     columns = [
-        "path", "precision", "quantization_stage", "layer_size", "hidden_layer_count",
+        "path", "precision", "quantization_stage", "color_space", "training_loss",
+        "hdr_transfer",
+        "highlight_linear_loss_weight", "highlight_percentile",
+        "layer_size", "hidden_layer_count",
         "linear_rgb_psnr_db", "log1p_rgb_psnr_db", "mean_exposure_psnr_db",
         "solid_angle_luminance_psnr_db", "mean_relative_absolute_error",
         "highlight_chromaticity_mae", "mlp_macs_per_query",

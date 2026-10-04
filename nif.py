@@ -135,6 +135,11 @@ def prepare_image_for_sampling(image, transfer_function, device):
     if transfer_function == "log":
         img_tensor = torch.log(img_tensor + eps)
         max_value = img_tensor.max().item()
+    elif transfer_function == "log1p":
+        img_tensor = torch.log1p(img_tensor)
+        max_value = img_tensor.max().item()
+    elif transfer_function != "linear":
+        raise ValueError(f"Unsupported transfer function: {transfer_function}")
 
     mean_value = img_tensor.mean(dim=(0, 1))
     img_tensor = img_tensor - mean_value
@@ -169,6 +174,35 @@ def sample_image(img_tensor, uv_coords):
 
     remap_coords = uv_coords * torch.tensor([height - 1, width - 1], device=device)
     return bilinear_interpolate(img_tensor, remap_coords)
+
+
+def decode_training_values(values, params):
+    """Differentiably decode normalized network values to linear radiance."""
+    mean = torch.as_tensor(params["mean"], device=values.device, dtype=torch.float32)
+    transformed = values.float() * float(params["max"]) + mean
+    transfer_function = params["transfer_function"]
+    if transfer_function == "log":
+        return torch.exp(transformed) - float(params["eps"])
+    if transfer_function == "log1p":
+        return torch.expm1(transformed)
+    if transfer_function == "linear":
+        return transformed
+    raise ValueError(f"Unsupported transfer function: {transfer_function}")
+
+
+def highlight_linear_mse(outputs, targets, params, threshold, radiance_scale):
+    """Linear-radiance MSE over target samples above a BGR luminance threshold."""
+    target_radiance = decode_training_values(targets, params)
+    output_radiance = decode_training_values(outputs, params)
+    target_luminance = (
+        0.0722 * target_radiance[:, 0]
+        + 0.7152 * target_radiance[:, 1]
+        + 0.2126 * target_radiance[:, 2]
+    )
+    bright = (target_luminance >= threshold).to(output_radiance.dtype).unsqueeze(1)
+    squared_error = ((output_radiance - target_radiance) / radiance_scale).square()
+    element_count = (bright.sum() * outputs.shape[1]).clamp_min(1)
+    return (squared_error * bright).sum() / element_count
 
 
 def encode_samples(image, uv_coords, transfer_function, device, debug_filename=""):
@@ -232,12 +266,15 @@ def decode_samples(image_shape, uv, values, params):
     decoded_values = values * params["max"]
 
     transfer_function = params["transfer_function"]
-    if transfer_function not in ["linear", "log"]:
+    if transfer_function not in ["linear", "log", "log1p"]:
         raise ValueError(f"Unsupported transfer function: {transfer_function}")
 
     if transfer_function == "log":
         decoded_values = decoded_values + np.array(params["mean"])
         decoded_values = np.exp(decoded_values) - params["eps"]
+    elif transfer_function == "log1p":
+        decoded_values = decoded_values + np.array(params["mean"])
+        decoded_values = np.expm1(decoded_values)
     else:
         decoded_values = decoded_values + np.array(params["mean"])
 
@@ -385,6 +422,4 @@ def run_inference(
     )
 
     return reconstructed
-
-
 

@@ -64,15 +64,20 @@ def main():
             "layer_size": config["layer_size"],
             "hidden_layer_count": config.get("hidden_layer_count"),
             "architecture": config.get("architecture", "legacy-v1"),
+            "color_space": config.get("color_space", "rgb"),
+            "training_loss": config.get("training_loss", "huber"),
+            "highlight_linear_loss_weight": config.get("highlight_linear_loss_weight", 0.0),
+            "highlight_percentile": config.get("highlight_percentile", 95.0),
+            "hdr_transfer": metadata["encode_params"]["transfer_function"],
             "parameter_count": sum(parameter.numel() for parameter in network.parameters()),
             "mlp_macs_per_query": sum(
                 layer.in_features * layer.out_features for layer in network.layers
-            ),
+            ) + (0 if network.color_matrix is None else 9),
             "mlp_deployment_bytes": sum(
                 layer.weight.numel()
                 + (0 if layer.bias is None else 2 * layer.bias.numel())
                 for layer in network.layers
-            ),
+            ) + (0 if network.color_matrix is None else 18),
             "hash_deployment_bytes": network.encoding.embedding.weight.numel() * 2,
         }
     )
