@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from fp8 import fake_fp8_linear, fake_quantize_fp16
 from nvfp4 import fake_quantize_nvfp4
 
 
@@ -97,6 +98,7 @@ class HashGridEncoding(nn.Module):
             persistent=False,
         )
         self.level_sizes = tuple(level_sizes)
+        self.fp16_qat = False
 
         # Corner offsets for vectorized corner computation: (4, 2)
         corner_offsets = torch.tensor(
@@ -168,9 +170,28 @@ class HashGridEncoding(nn.Module):
         f11 = corner_features[:, :, 3, :]
 
         # Bilinear interpolation: lerp in x, then lerp in y
-        f0 = f00 * (1 - u_frac) + f01 * u_frac  # bottom edge
-        f1 = f10 * (1 - u_frac) + f11 * u_frac  # top edge
-        interpolated = f0 * (1 - v_frac) + f1 * v_frac  # (N, L, F)
+        if self.fp16_qat:
+            # Match the renderer's FP16 table, half weights, half subtraction,
+            # and half FMA outputs while retaining FP32 master parameters.
+            f00 = fake_quantize_fp16(f00)
+            f01 = fake_quantize_fp16(f01)
+            f10 = fake_quantize_fp16(f10)
+            f11 = fake_quantize_fp16(f11)
+            u_frac = fake_quantize_fp16(u_frac)
+            v_frac = fake_quantize_fp16(v_frac)
+            f0 = fake_quantize_fp16(
+                u_frac * fake_quantize_fp16(f01 - f00) + f00
+            )
+            f1 = fake_quantize_fp16(
+                u_frac * fake_quantize_fp16(f11 - f10) + f10
+            )
+            interpolated = fake_quantize_fp16(
+                v_frac * fake_quantize_fp16(f1 - f0) + f0
+            )
+        else:
+            f0 = f00 * (1 - u_frac) + f01 * u_frac  # bottom edge
+            f1 = f10 * (1 - u_frac) + f11 * u_frac  # top edge
+            interpolated = f0 * (1 - v_frac) + f1 * v_frac  # (N, L, F)
 
         # Flatten levels: (N, L, F) -> (N, L*F)
         return interpolated.reshape(N, L * F)
@@ -179,6 +200,9 @@ class HashGridEncoding(nn.Module):
     def output_dim(self):
         """Output dimension of the encoding."""
         return self.n_levels * self.n_features
+
+    def set_fp16_qat(self, enabled=True):
+        self.fp16_qat = enabled
 
 
 class NIFModel(nn.Module):
@@ -194,6 +218,7 @@ class NIFModel(nn.Module):
         num_layers,
         color_matrix=None,
         encoding=None,
+        skip_index=None,
     ):
         """
         Args:
@@ -202,6 +227,8 @@ class NIFModel(nn.Module):
             num_layers: Number of MLP layers
             color_matrix: Optional color space conversion matrix
             encoding: HashGridEncoding module
+            skip_index: Layer after which to concatenate the encoded input. None
+                preserves the legacy layer-count and skip-placement behavior.
         """
         super().__init__()
 
@@ -216,7 +243,7 @@ class NIFModel(nn.Module):
         else:
             mlp_input_dim = input_dim
 
-        self.use_skip = num_layers >= 4
+        self.use_skip = num_layers >= 4 if skip_index is None else skip_index >= 0
 
         if self.use_skip and layer_size <= mlp_input_dim:
             raise ValueError(
@@ -224,7 +251,10 @@ class NIFModel(nn.Module):
                 f"to accommodate skip connections"
             )
 
-        self.skip_index = num_layers // 2 if self.use_skip else -1
+        self.skip_index = (
+            num_layers // 2 if skip_index is None and self.use_skip else
+            skip_index if self.use_skip else -1
+        )
         concat_dim = mlp_input_dim if self.use_skip else 0
 
         # Build MLP layers
@@ -256,6 +286,7 @@ class NIFModel(nn.Module):
             layers.append(layer)
 
         self.layers = nn.ModuleList(layers)
+        self.fp8_qat = False
         self.nvfp4_qat = False
         self.nvfp4_static_activation_scales = False
         self.register_buffer(
@@ -285,6 +316,13 @@ class NIFModel(nn.Module):
             self.nvfp4_static_activation_scales = True
         self.nvfp4_qat = enabled
 
+    def set_fp8_qat(self, enabled=True):
+        self.fp8_qat = enabled
+
+    def set_hash_fp16_qat(self, enabled=True):
+        if self.encoding is not None:
+            self.encoding.set_fp16_qat(enabled)
+
     def forward(self, x):
         # Apply encoding if present
         if self.encoding is not None:
@@ -301,6 +339,8 @@ class NIFModel(nn.Module):
                 quantized_input = fake_quantize_nvfp4(x, (1, 16), activation_scale)
                 quantized_weight = fake_quantize_nvfp4(layer.weight, (16, 16))
                 x = F.linear(quantized_input, quantized_weight, layer.bias)
+            elif self.fp8_qat:
+                x = fake_fp8_linear(x, layer.weight, layer.bias)
             else:
                 x = layer(x)
 
@@ -328,14 +368,30 @@ def model_from_config(config):
         max_resolution=hash_config.get("max_resolution", 2048),
         layout=hash_config.get("layout", "hash"),
     )
+    architecture = config.get("architecture", "legacy-v1")
+    hidden_layer_count = config.get("hidden_layer_count")
+    if architecture == "paper-skip-v1":
+        if hidden_layer_count is None or hidden_layer_count < 2 or hidden_layer_count % 2:
+            raise ValueError("paper-skip-v1 requires a positive even hidden_layer_count")
+        num_layers = hidden_layer_count + 1
+        skip_index = hidden_layer_count // 2 - 1
+    elif architecture == "legacy-v1":
+        num_layers = config["num_layers"]
+        skip_index = None
+    else:
+        raise ValueError(f"Unknown NIF architecture: {architecture}")
+
     model = NIFModel(
         input_dim=config.get("input_dim", 2),
         layer_size=config["layer_size"],
-        num_layers=config["num_layers"],
+        num_layers=num_layers,
         color_matrix=config.get("color_matrix"),
         encoding=encoding,
+        skip_index=skip_index,
     )
     quantization = config.get("quantization", {})
+    model.set_fp8_qat(quantization.get("mlp") == "fp8-e4m3")
+    model.set_hash_fp16_qat(quantization.get("hash") == "fp16")
     model.set_nvfp4_qat(
         quantization.get("mlp") == "nvfp4",
         quantization.get("activation_global_scales"),
@@ -356,7 +412,11 @@ def calibrate_nvfp4_activation_scales(model, inputs, batch_size=65536):
 
     was_training = model.training
     was_quantized = model.nvfp4_qat
+    was_fp8_quantized = model.fp8_qat
+    was_hash_quantized = model.encoding is not None and model.encoding.fp16_qat
     model.set_nvfp4_qat(False)
+    model.set_fp8_qat(False)
+    model.set_hash_fp16_qat(False)
     model.eval()
     try:
         with torch.no_grad():
@@ -367,6 +427,8 @@ def calibrate_nvfp4_activation_scales(model, inputs, batch_size=65536):
             hook.remove()
         model.train(was_training)
         model.set_nvfp4_qat(was_quantized)
+        model.set_fp8_qat(was_fp8_quantized)
+        model.set_hash_fp16_qat(was_hash_quantized)
 
     denominator = 448.0 * 6.0
     return torch.where(maxima > 0, maxima / denominator, torch.ones_like(maxima))
@@ -381,7 +443,10 @@ def load_model_checkpoint(path, device="cpu", quantized=None):
     model = model_from_config(checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state_dict"])
     if quantized is not None:
-        model.set_nvfp4_qat(quantized)
+        quantization = checkpoint["model_config"].get("quantization", {}).get("mlp")
+        model.set_nvfp4_qat(quantized and quantization == "nvfp4")
+        model.set_fp8_qat(quantized and quantization == "fp8-e4m3")
+        model.set_hash_fp16_qat(quantized and quantization in {"nvfp4", "fp8-e4m3"})
     return model.to(device), checkpoint
 
 

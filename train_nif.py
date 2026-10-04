@@ -5,9 +5,11 @@ import torch.nn as nn
 import torch.optim as optim
 import argparse
 import cv2
+import json
 import numpy as np
 import nif
 import model as nif_model
+from quality_metrics import hdr_quality_metrics
 import time
 import sys
 import os
@@ -64,7 +66,16 @@ def parse_args():
         "--layer-count",
         type=int,
         default=2,
-        help="Number of MLP layers. Should be multiple of 2 for >= 4 layers.",
+        help="Legacy total MLP layer count, including output.",
+    )
+    parser.add_argument(
+        "--hidden-layer-count",
+        type=int,
+        default=0,
+        help=(
+            "Paper-style number of hidden dense-ReLU layers (positive even value); "
+            "uses a midpoint skip and supersedes --layer-count."
+        ),
     )
     parser.add_argument(
         "--train-samples",
@@ -197,6 +208,17 @@ def parse_args():
         help="Absolute epoch at which NVFP4 fake quantization begins.",
     )
     parser.add_argument(
+        "--fp8-qat",
+        action="store_true",
+        help="Fine-tune MLP weights and activations using unscaled E4M3 fake quantization.",
+    )
+    parser.add_argument(
+        "--fp8-start-epoch",
+        type=int,
+        default=0,
+        help="Absolute epoch at which E4M3 fake quantization begins.",
+    )
+    parser.add_argument(
         "--nvfp4-calibration-samples",
         type=int,
         default=262144,
@@ -220,6 +242,7 @@ def parse_args():
         default=2048,
         help="Batch size used for final full-image PSNR evaluation.",
     )
+    parser.add_argument("--seed", type=int, default=1, help="Random seed.")
     args = parser.parse_args()
     return args
 
@@ -227,12 +250,25 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    if args.hidden_layer_count and (
+        args.hidden_layer_count < 2 or args.hidden_layer_count % 2
+    ):
+        raise ValueError("--hidden-layer-count must be a positive even value")
     if args.layer_count >= 4 and args.layer_count % 2:
         raise ValueError(
             "Layer count >= 4 must be a multiple of 2 (for skip connections)."
         )
     if args.nvfp4_start_epoch < 0:
         raise ValueError("--nvfp4-start-epoch must be non-negative")
+    if args.fp8_start_epoch < 0:
+        raise ValueError("--fp8-start-epoch must be non-negative")
+    if args.nvfp4_qat and args.fp8_qat:
+        raise ValueError("--nvfp4-qat and --fp8-qat are mutually exclusive")
     if args.nvfp4_calibration_samples < 1:
         raise ValueError("--nvfp4-calibration-samples must be positive")
     if args.distillation_weight < 0:
@@ -357,17 +393,29 @@ if __name__ == "__main__":
 
     if not args.resume:
         color_matrix = nif.color_space_to_bgr_matrix(args.color_space)
+        paper_architecture = args.hidden_layer_count > 0
+        num_layers = (
+            args.hidden_layer_count + 1 if paper_architecture else args.layer_count
+        )
+        skip_index = (
+            args.hidden_layer_count // 2 - 1 if paper_architecture else None
+        )
         model_obj = nif_model.NIFModel(
             input_dim=2,
             layer_size=args.layer_size,
-            num_layers=args.layer_count,
+            num_layers=num_layers,
             color_matrix=color_matrix,
             encoding=encoding_module,
+            skip_index=skip_index,
         ).to(device)
         model_config = {
             "input_dim": 2,
             "layer_size": args.layer_size,
-            "num_layers": args.layer_count,
+            "num_layers": num_layers,
+            "architecture": "paper-skip-v1" if paper_architecture else "legacy-v1",
+            "hidden_layer_count": (
+                args.hidden_layer_count if paper_architecture else None
+            ),
             "color_matrix": color_matrix,
             "hashgrid_config": {
                 "n_levels": args.hashgrid_levels,
@@ -382,6 +430,9 @@ if __name__ == "__main__":
 
     existing_quantization = model_config.get("quantization", {})
     use_nvfp4 = args.nvfp4_qat or existing_quantization.get("mlp") == "nvfp4"
+    use_fp8 = args.fp8_qat or existing_quantization.get("mlp") == "fp8-e4m3"
+    if use_nvfp4 and use_fp8:
+        raise ValueError("A checkpoint cannot use both NVFP4 and FP8 QAT")
     if use_nvfp4:
         activation_scales = existing_quantization.get("activation_global_scales")
         if activation_scales is None:
@@ -407,6 +458,15 @@ if __name__ == "__main__":
             "activation_block_shape": [1, 16],
             "activation_global_scales": activation_scales,
         }
+    elif use_fp8:
+        model_obj.set_fp8_qat(False)
+        model_obj.set_hash_fp16_qat(False)
+        model_config["quantization"] = {
+            "mlp": "fp8-e4m3",
+            "values": "e4m3fn",
+            "scaling": "none",
+            "hash": "fp16",
+        }
 
     print(f"\nModel created:")
     total_params = sum(p.numel() for p in model_obj.parameters())
@@ -427,7 +487,11 @@ if __name__ == "__main__":
     final_epoch = first_epoch + num_epochs
     if use_nvfp4 and args.nvfp4_start_epoch >= final_epoch:
         raise ValueError("--nvfp4-start-epoch must occur within this training run")
+    if use_fp8 and args.fp8_start_epoch >= final_epoch:
+        raise ValueError("--fp8-start-epoch must occur within this training run")
     model_obj.set_nvfp4_qat(use_nvfp4 and first_epoch >= args.nvfp4_start_epoch)
+    model_obj.set_fp8_qat(use_fp8 and first_epoch >= args.fp8_start_epoch)
+    model_obj.set_hash_fp16_qat(use_fp8 and first_epoch >= args.fp8_start_epoch)
     base_model = model_obj
 
     # Compile model if requested
@@ -469,8 +533,11 @@ if __name__ == "__main__":
 
     epoch_start_time = time.time()
     for epoch in range(first_epoch, final_epoch):
-        qat_active = use_nvfp4 and epoch >= args.nvfp4_start_epoch
-        base_model.set_nvfp4_qat(qat_active)
+        nvfp4_active = use_nvfp4 and epoch >= args.nvfp4_start_epoch
+        fp8_active = use_fp8 and epoch >= args.fp8_start_epoch
+        base_model.set_nvfp4_qat(nvfp4_active)
+        base_model.set_fp8_qat(fp8_active)
+        base_model.set_hash_fp16_qat(fp8_active)
         model_obj.train()
 
         # Regenerate samples each epoch for stochastic mode
@@ -539,7 +606,8 @@ if __name__ == "__main__":
         print(
             f"Epoch {epoch}: {epoch_time:.2f}s, loss={avg_loss:.6f}, "
             f"reconstruction={avg_reconstruction_loss:.6f}, "
-            f"distillation={avg_distillation_loss:.6f}, nvfp4={qat_active}"
+            f"distillation={avg_distillation_loss:.6f}, "
+            f"nvfp4={nvfp4_active}, fp8={fp8_active}"
         )
         sys.stdout.flush()
         epoch_start_time = time.time()
@@ -598,6 +666,8 @@ if __name__ == "__main__":
     # Final PSNR evaluation
     print("\nEvaluating final PSNR...")
     base_model.set_nvfp4_qat(use_nvfp4)
+    base_model.set_fp8_qat(use_fp8)
+    base_model.set_hash_fp16_qat(use_fp8)
     reconstructed = nif.run_inference(
         model=base_model,
         device=device,
@@ -608,3 +678,37 @@ if __name__ == "__main__":
     psnr = nif.compute_psnr(args.input, reconstructed)
     if psnr:
         print(f"PSNR RGB={psnr['rgb']:.2f} L={psnr['l']:.2f} AB={psnr['ab']:.2f}")
+    quality = hdr_quality_metrics(img, reconstructed)
+    quality["precision"] = (
+        "nvfp4-mlp-fp16-hash" if use_nvfp4 else
+        "fp8-mlp-fp16-hash" if use_fp8 else
+        "training"
+    )
+    quality.update(
+        {
+            "quantization_stage": (
+                "nvfp4-qat" if use_nvfp4 else "qat" if use_fp8 else "teacher"
+            ),
+            "layer_size": model_config["layer_size"],
+            "hidden_layer_count": model_config.get("hidden_layer_count"),
+            "architecture": model_config.get("architecture", "legacy-v1"),
+            "parameter_count": sum(parameter.numel() for parameter in base_model.parameters()),
+            "mlp_macs_per_query": sum(
+                layer.in_features * layer.out_features for layer in base_model.layers
+            ),
+            "mlp_deployment_bytes": sum(
+                layer.weight.numel()
+                + (0 if layer.bias is None else 2 * layer.bias.numel())
+                for layer in base_model.layers
+            ),
+            "hash_deployment_bytes": base_model.encoding.embedding.weight.numel() * 2,
+        }
+    )
+    quality_path = os.path.join(args.model, "quality_metrics.json")
+    with open(quality_path, "w") as file:
+        json.dump(quality, file, indent=2, sort_keys=True)
+    print(
+        f"HDR metrics: linear={quality['linear_rgb_psnr_db']:.2f} dB, "
+        f"log1p={quality['log1p_rgb_psnr_db']:.2f} dB, "
+        f"exposure-mean={quality['mean_exposure_psnr_db']:.2f} dB"
+    )

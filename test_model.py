@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from model import HashGridEncoding
+from model import HashGridEncoding, model_from_config
 
 
 def test_hybrid_layout_uses_dense_coarse_levels_and_hashed_fine_levels():
@@ -38,3 +38,44 @@ def test_per_level_hash_budgets_control_packed_offsets():
 def test_per_level_hash_budget_count_must_match_levels():
     with pytest.raises(ValueError, match="one value per level"):
         HashGridEncoding(n_levels=3, level_log2_hashmap_sizes=[4, 5])
+
+
+def test_paper_architecture_uses_requested_hidden_layers_and_midpoint_skip():
+    network = model_from_config(
+        {
+            "input_dim": 2,
+            "layer_size": 64,
+            "num_layers": 5,
+            "architecture": "paper-skip-v1",
+            "hidden_layer_count": 4,
+            "hashgrid_config": {
+                "n_levels": 12,
+                "n_features": 2,
+                "log2_hashmap_size": 4,
+            },
+        }
+    )
+
+    assert len(network.layers) == 5
+    assert network.skip_index == 1
+    assert network.layers[1].out_features == 40
+    assert network.layers[2].in_features == 64
+    assert network(torch.rand(3, 2)).shape == (3, 3)
+
+
+def test_legacy_architecture_keeps_existing_layer_semantics():
+    network = model_from_config(
+        {
+            "input_dim": 2,
+            "layer_size": 64,
+            "num_layers": 2,
+            "hashgrid_config": {
+                "n_levels": 12,
+                "n_features": 2,
+                "log2_hashmap_size": 4,
+            },
+        }
+    )
+
+    assert len(network.layers) == 2
+    assert network.skip_index == -1

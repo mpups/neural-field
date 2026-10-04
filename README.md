@@ -66,3 +66,37 @@ Training also writes `nvfp4.pt`, which contains nibble-packed MLP weights and
 logical row-major scales. The scale layout is intentionally unswizzled: a
 future CUDA/CUTLASS backend must transform it to the hardware matrix layout.
 The current ray tracer cannot execute this packed artifact yet.
+
+## HDR quality and FP8 capacity sweeps
+
+The renderer's current production target uses an FP16 hash grid and unscaled
+E4M3 MLP weights and activations. Evaluate any checkpoint at that precision:
+
+```bash
+python evaluate_nif.py \
+  --model ./saved_model \
+  --original image.hdr \
+  --precision fp8
+```
+
+Unlike the legacy `--layer-count`, `--hidden-layer-count` follows the paper:
+it counts dense-ReLU hidden layers, adds a separate RGB output layer, and uses
+the midpoint skip connection. The count must be positive and even.
+
+Run the initial capacity ablation with FP8 post-training evaluation after every
+teacher model. Add `--fp8-qat` to also fine-tune and evaluate an E4M3 model for
+each architecture:
+
+```bash
+python sweep_nif.py \
+  --input image.hdr \
+  --output-root ./sweeps/capacity-rgb \
+  --architectures 64x2,128x2,256x2,128x4,256x4,320x6 \
+  --seeds 1 \
+  --fp8-qat
+```
+
+The summary contains radiometric PSNR, log-domain PSNR, solid-angle-weighted
+luminance and energy errors, highlight chromaticity error, an exposure-stack
+display metric, deployment bytes, and MLP MACs per query. Full-precision
+teachers and post-training FP8 results are kept separate from FP8-QAT outputs.

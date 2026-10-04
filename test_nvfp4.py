@@ -7,7 +7,68 @@ from model import (
     load_model_checkpoint,
     model_from_config,
 )
+from fp8 import fake_fp8_linear, fake_quantize_e4m3, fake_quantize_fp16
 from nvfp4 import export_nvfp4, fake_quantize_nvfp4, pack_e2m1, quantize_nvfp4
+
+
+def test_fp8_fake_quantization_matches_e4m3_and_preserves_gradients():
+    values = torch.tensor([[0.1, 1.1, 448.0]], requires_grad=True)
+    quantized = fake_quantize_e4m3(values)
+
+    torch.testing.assert_close(
+        quantized, values.detach().to(torch.float8_e4m3fn).float(), rtol=0, atol=0
+    )
+    quantized.sum().backward()
+    torch.testing.assert_close(values.grad, torch.ones_like(values))
+
+
+def test_fp8_linear_rounds_operands_to_e4m3_and_output_to_fp16():
+    inputs = torch.tensor([[1.1, 0.1]])
+    weight = torch.tensor([[1.1, 0.1]])
+    bias = torch.tensor([0.0001])
+
+    expected = torch.nn.functional.linear(
+        inputs.to(torch.float8_e4m3fn).float(),
+        weight.half().to(torch.float8_e4m3fn).float(),
+        bias.half().float(),
+    ).half().float()
+    torch.testing.assert_close(
+        fake_fp8_linear(inputs, weight, bias), expected, rtol=0, atol=0
+    )
+
+
+def test_fp16_hash_fake_quantization_preserves_gradients():
+    values = torch.tensor([0.1, 1.1], requires_grad=True)
+    quantized = fake_quantize_fp16(values)
+
+    torch.testing.assert_close(quantized, values.detach().half().float(), rtol=0, atol=0)
+    quantized.sum().backward()
+    torch.testing.assert_close(values.grad, torch.ones_like(values))
+
+
+def test_fp8_checkpoint_restores_quantized_forward(tmp_path):
+    config = {
+        "input_dim": 2,
+        "layer_size": 16,
+        "num_layers": 2,
+        "hashgrid_config": {
+            "n_levels": 2,
+            "n_features": 2,
+            "log2_hashmap_size": 4,
+            "base_resolution": 2,
+            "max_resolution": 8,
+        },
+        "quantization": {"mlp": "fp8-e4m3", "hash": "fp16"},
+    }
+    network = model_from_config(config)
+    path = tmp_path / "model.pt"
+    torch.save({"model_config": config, "model_state_dict": network.state_dict()}, path)
+
+    restored, _ = load_model_checkpoint(path)
+    assert restored.fp8_qat
+    assert not restored.nvfp4_qat
+    assert restored.encoding.fp16_qat
+    assert restored(torch.rand(3, 2)).shape == (3, 3)
 
 
 def test_nvfp4_uses_e2m1_values_and_two_level_scaling():
