@@ -127,9 +127,9 @@ def pack_e2m1(codes: torch.Tensor) -> torch.Tensor:
 
 
 def export_nvfp4(model, output: str | Path) -> None:
-    """Export packed MLP weights and logical scales for a future CUDA backend."""
+    """Export NVFP4 hidden layers and the mandatory FP8 output projection."""
     layers = {}
-    for index, layer in enumerate(model.layers):
+    for index, layer in enumerate(model.layers[:-1]):
         quantized = quantize_nvfp4(layer.weight, (16, 16))
         layers[str(index)] = {
             "values": pack_e2m1(quantized.codes),
@@ -140,17 +140,30 @@ def export_nvfp4(model, output: str | Path) -> None:
             "block_shape": quantized.block_shape,
             "bias_fp16": None if layer.bias is None else layer.bias.detach().half().cpu(),
         }
+    output_layer = model.layers[-1]
+    fp8_weight = (
+        output_layer.weight.detach().half().to(torch.float8_e4m3fn).view(torch.uint8).cpu()
+    )
     torch.save(
         {
-            "format": "nvfp4-e2m1",
-            "version": 1,
+            "format": "nvfp4-hidden-fp8-output",
+            "version": 2,
             "weight_scaling": "2d-16x16-e4m3-with-fp32-global",
             "activation_scaling": "1d-1x16-e4m3-with-fp32-global",
             "activation_global_scales_fp32": (
-                model.nvfp4_activation_global_scales.detach().cpu()
+                model.nvfp4_activation_global_scales[:-1].detach().cpu()
             ),
             "scale_layout": "logical-row-major-unswizzled",
             "layers": layers,
+            "output_layer": {
+                "format": "fp8-e4m3fn",
+                "weight": fp8_weight,
+                "logical_shape": tuple(output_layer.weight.shape),
+                "bias_fp16": (
+                    None if output_layer.bias is None
+                    else output_layer.bias.detach().half().cpu()
+                ),
+            },
         },
         Path(output),
     )

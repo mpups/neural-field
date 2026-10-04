@@ -497,6 +497,7 @@ if __name__ == "__main__":
         model_obj.set_nvfp4_qat(False, activation_scales)
         model_config["quantization"] = {
             "mlp": "nvfp4",
+            "output_layer": "fp8-e4m3",
             "values": "e2m1",
             "block_scale": "e4m3",
             "global_scale": "fp32",
@@ -740,7 +741,7 @@ if __name__ == "__main__":
         print(f"PSNR RGB={psnr['rgb']:.2f} L={psnr['l']:.2f} AB={psnr['ab']:.2f}")
     quality = hdr_quality_metrics(img, reconstructed)
     quality["precision"] = (
-        "nvfp4-mlp-fp16-hash" if use_nvfp4 else
+        "nvfp4-hidden-fp8-output-fp16-hash" if use_nvfp4 else
         "fp8-mlp-fp16-hash" if use_fp8 else
         "training"
     )

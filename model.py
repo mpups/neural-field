@@ -332,13 +332,16 @@ class NIFModel(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if self.nvfp4_qat:
-                activation_scale = (
-                    self.nvfp4_activation_global_scales[i]
-                    if self.nvfp4_static_activation_scales else None
-                )
-                quantized_input = fake_quantize_nvfp4(x, (1, 16), activation_scale)
-                quantized_weight = fake_quantize_nvfp4(layer.weight, (16, 16))
-                x = F.linear(quantized_input, quantized_weight, layer.bias)
+                if i == len(self.layers) - 1:
+                    x = fake_fp8_linear(x, layer.weight, layer.bias)
+                else:
+                    activation_scale = (
+                        self.nvfp4_activation_global_scales[i]
+                        if self.nvfp4_static_activation_scales else None
+                    )
+                    quantized_input = fake_quantize_nvfp4(x, (1, 16), activation_scale)
+                    quantized_weight = fake_quantize_nvfp4(layer.weight, (16, 16))
+                    x = F.linear(quantized_input, quantized_weight, layer.bias)
             elif self.fp8_qat:
                 x = fake_fp8_linear(x, layer.weight, layer.bias)
             else:
@@ -351,7 +354,7 @@ class NIFModel(nn.Module):
                 x = torch.relu(x)
 
         if self.color_matrix is not None:
-            if self.fp8_qat:
+            if self.fp8_qat or self.nvfp4_qat:
                 # The paper's fixed colour conversion remains outside the
                 # quantized MLP but executes with renderer-compatible FP16 I/O.
                 x = F.linear(

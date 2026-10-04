@@ -151,12 +151,17 @@ def test_export_contains_packed_weights_and_scaling_contract(tmp_path):
     export_nvfp4(model, output)
     checkpoint = torch.load(output, weights_only=True)
 
-    assert checkpoint["format"] == "nvfp4-e2m1"
+    assert checkpoint["format"] == "nvfp4-hidden-fp8-output"
+    assert checkpoint["version"] == 2
     assert checkpoint["scale_layout"] == "logical-row-major-unswizzled"
-    assert checkpoint["activation_global_scales_fp32"].tolist() == [1.0, 1.0]
+    assert checkpoint["activation_global_scales_fp32"].tolist() == [1.0]
     assert checkpoint["layers"]["0"]["logical_shape"] == (16, 4)
     assert checkpoint["layers"]["0"]["padded_shape"] == (16, 16)
     assert checkpoint["layers"]["0"]["values"].numel() == 128
+    assert "1" not in checkpoint["layers"]
+    assert checkpoint["output_layer"]["format"] == "fp8-e4m3fn"
+    assert checkpoint["output_layer"]["logical_shape"] == (3, 16)
+    assert checkpoint["output_layer"]["weight"].numel() == 48
 
 
 def test_quantized_checkpoint_restores_fake_quantized_forward(tmp_path):
